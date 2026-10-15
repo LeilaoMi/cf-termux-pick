@@ -152,7 +152,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.0\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.1\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -167,6 +167,10 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         # 1034 = 边缘回源，不服务这个 zone
         if "1034" in text[:200] or "error code: 1034" in text.lower():
             return {"_error": "1034"}
+        # Zeus: 403/409/429 = 可达但拒绝，直接丢弃不重试
+        first_line = text.split("\r\n", 1)[0] if "\r\n" in text else ""
+        if any(code in first_line for code in ("403", "409", "429")):
+            return {"_blocked": True}
         body = text.split("\r\n\r\n", 1)[-1]
         d = {}
         for line in body.strip().split("\n"):
@@ -203,7 +207,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.0\r\n\r\n")
+               f"User-Agent: cf-pick/2.1\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -260,7 +264,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.0\r\n\r\n")
+               f"User-Agent: cf-pick/2.1\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -447,7 +451,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.0\r\n\r\n")
+               f"User-Agent: cf-pick/2.1\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -613,53 +617,75 @@ def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
     ips = sample_ips(family, count)
     print(f"采样 {len(ips)} 个")
 
-    # L1: TCP 延迟
+    # L1: TCP 3探针（取最差，算丢包率+抖动）— cfnb/Zeus 方法论
     lat_ok = []
     for ip in ips:
-        lat = tcp_ping(ip, timeout=3)
-        if lat is not None and lat < 1.0:
-            lat_ok.append((ip, lat))
-    lat_ok.sort(key=lambda x: x[1])
-    print(f"L1 TCP延迟 <1s：{len(lat_ok)}")
+        lats = []
+        fails = 0
+        for _ in range(3):
+            lat = tcp_ping(ip, timeout=3)
+            if lat is None:
+                fails += 1
+            else:
+                lats.append(lat)
+            time.sleep(0.12)  # Zeus: 120ms 间隔，防热路径掩盖丢包
+        if not lats:
+            continue
+        loss = fails / 3.0
+        if loss > 0.5:
+            continue  # 丢包过半直接扔
+        worst = max(lats)
+        if worst >= 1.0:
+            continue
+        jitter = statistics.pstdev(lats) if len(lats) > 1 else 0.0
+        lat_ok.append((ip, worst, loss, jitter))
+    lat_ok.sort(key=lambda x: (x[2], x[1]))  # 丢包优先，其次延迟
+    print(f"L1 TCP 3探针（丢包≤50%, 延迟<1s）：{len(lat_ok)}")
     if not lat_ok:
         return []
 
     # L2: colo 校验
     colo_ok = []
-    for ip, lat in lat_ok[:80]:
+    for ip, lat, loss, jitter in lat_ok[:80]:
         tr = fetch_trace(ip, sni)
         if not tr or tr.get("_error"):
             continue
+        # Zeus: 403/409/429 = 可达但拒绝，直接进墓碑
+        if tr.get("_blocked"):
+            continue
         if tr.get("colo") == colo:
-            colo_ok.append((ip, lat))
+            colo_ok.append((ip, lat, loss, jitter))
     print(f"L2 colo={colo}：{len(colo_ok)}")
     if not colo_ok:
         return []
 
     # L3: 送中过滤
     geo_ok = []
-    for ip, lat in colo_ok:
+    for ip, lat, loss, jitter in colo_ok:
         is_cn, country = check_geo(ip)
         if not is_cn:
-            geo_ok.append((ip, lat, country))
+            geo_ok.append((ip, lat, loss, jitter, country))
     print(f"L3 非 CN：{len(geo_ok)}")
     if not geo_ok:
         return []
 
     # L4: 测速
     scored = []
-    for ip, lat, country in geo_ok[:30]:
+    for ip, lat, loss, jitter, country in geo_ok[:30]:
         mbps = speed_test(ip, sni)
         if mbps > 1.0:
             scored.append({"ip": ip, "family": family,
                            "latency_ms": round(lat * 1000, 1),
+                           "loss_pct": round(loss * 100, 1),
+                           "jitter_ms": round(jitter * 1000, 1),
                            "mbps": round(mbps, 2), "country": country,
                            "colo": colo})
     scored.sort(key=lambda x: -x["mbps"])
     top = scored[:top_n]
     print(f"L4 测速 >1MB/s：{len(scored)}，取 Top {len(top)}")
     for c in top:
-        print(f"  {c['ip']} {c['latency_ms']}ms {c['mbps']}MB/s")
+        print(f"  {c['ip']} {c['latency_ms']}ms "
+              f"丢包{c['loss_pct']}% 抖动{c['jitter_ms']}ms {c['mbps']}MB/s")
     return top
 
 
@@ -757,10 +783,26 @@ def main():
             # 历史可靠性
             hist = historical_reliability(conn, ip)
             c["history"] = hist
-            # 综合评分：速度 0.7 + 稳定 0.3（历史作为加成展示）
-            speed_norm = min(c["mbps"] / 20.0 * 100, 100)  # 20MB/s 满分
-            final_score = round(speed_norm * 0.7 + score * 0.3, 1)
-            c["final_score"] = final_score
+            # v2.1 评分：Zeus 扣分制 + zqy857 完整度/新鲜度 + 带宽加成
+            # 基础 100，丢包第一（无上限），延迟第二，抖动第三
+            s = 100.0
+            s -= c.get("loss_pct", 0) * 0.9
+            s -= min(45.0, c["latency_ms"] / 1000.0 * 45.0)
+            s -= min(20.0, c.get("jitter_ms", 0) / 200.0 * 20.0)
+            # 完整度折扣（zqy857）：没测带宽最高 53
+            # （这里带宽已测，完整度=1，不打折；保留逻辑供未来）
+            # 带宽加成：20MB/s 满分 10 分（AI 够用就行，不主导）
+            s += min(10.0, (c["mbps"] / 20.0) ** 0.65 * 10.0)
+            # 稳定性加成：burn-in 稳定分换算
+            s = s * 0.7 + score * 0.3
+            # 新鲜度衰减（zqy857）：历史越老分越低
+            if hist is not None:
+                # hist 已经是时间衰减后的值，直接融合
+                s = s * 0.8 + hist * 0.2
+            # GFW 敏感降权（但不直接扔，冷却后可能恢复）
+            if c["gfw_sensitive"]:
+                s *= 0.85
+            c["final_score"] = round(max(0, s), 1)
             # 入库
             record_history(conn, ip, c["family"], args.colo, carrier,
                            c["latency_ms"], c["mbps"],
@@ -788,6 +830,9 @@ def main():
                 extra += f" ⚠️GFW敏感×{c['rst_hits']}"
             if c.get("history"):
                 extra += f" 历史{c['history']}"
+        else:
+            # 非 burn-in 模式也显示丢包/抖动
+            extra = f" 丢包{c.get('loss_pct',0)}% 抖动{c.get('jitter_ms',0)}ms"
         print(f"  {i}. {c['ip']} [{fam}] {c['mbps']}MB/s "
               f"分{c['final_score']}{extra}")
 
@@ -814,7 +859,7 @@ def main():
             f.write(f"{c['ip']}#v{c['family']}-{args.colo}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"colo": args.colo, "carrier": carrier,
-                   "version": "2.0",
+                   "version": "2.1",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
