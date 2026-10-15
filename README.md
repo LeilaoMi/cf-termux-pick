@@ -1,93 +1,141 @@
 # cf-termux-pick
 
-Termux 上的 Cloudflare 优选 IP 扫描器。单文件、零依赖，`python` 一条命令直接跑。
+Termux 上的 Cloudflare 优选 IP 扫描器。单文件、零依赖，手机上直接跑。
 
-## 为什么做这个
+## 定位
 
-我是 AI 重度用户，需要固定美国机房的干净 CF IP。LAX 已被谷歌大面积"送中"（归属地判为中国，AI 服务直接不可用），所以默认锁定 **SJC（圣何塞）**，并自带送中过滤。
+我是 AI 重度用户，需要**干净、稳定**的 CF IP。不锁机房，不看广告看疗效——只看三层纯净度。
 
-## 用法
+## 快速开始
 
 ```bash
-# Termux 里
-python cf-pick.py                      # 默认：SJC，Top 20
-python cf-pick.py --colo SJC --top 30  # 指定机房和数量
-python cf-pick.py --samples 100        # 每段采样 100 个（默认 50）
-python cf-pick.py --concurrency 20     # 手机流量建议调低并发（默认 50）
-python cf-pick.py --dry-run            # 只采样不测试
+# 最常用：AI 场景，一键跑完自动推送
+python cf-pick.py --scene=ai --push
+
+# 带你的 10 个 SNI 做健康检查
+python cf-pick.py --scene=ai --sni=sni1.com,sni2.com --push
+
+# 晚高峰复测（21-23点跑）
+python cf-pick.py --scene=ai --evening --push
 ```
 
-## 原理（四层漏斗）
+## 核心设计
 
-1. **TCP 延迟初筛** — 只测 443 建连，超 800ms 直接扔
-2. **colo 校验** — `/cdn-cgi/trace` 确认落地机房，只要目标 colo
-3. **送中过滤** — 双归属地库查 IP，任一报 CN 就扔；同时排掉 1034 错误 IP（真 CF 但不服务你的 zone）
-4. **测速** — 只对幸存者下 `speed.cloudflare.com` 测速，0 速度（回源 IP）直接扔
+### 并发漏斗（v2.3）
+
+| 层 | 并发 | 说明 |
+|---|---|---|
+| L1 TCP 3探针 | 20 | 最便宜，手机安全值 |
+| L2 TLS trace | 10 | 耗 CPU，防自干扰 |
+| L3 Geo 检查 | 5 | ip-api 限流 45/分钟 |
+| L4 测速 | 2 | 最耗流量 |
+
+100 采样约 40 秒，300 采样约 2 分钟。
+
+### 智能采样（v2.4）
+
+- 60% 从历史优质 /24 邻域采样（SQLite 学习）
+- 40% 随机探索（发现新富矿）
+- 越跑越准，冷启动退化为纯随机
+
+### 纯净度三层（v2.2/v2.5）
+
+1. **Geo 一致性**：ip-api 查归属地，非 CN 才留
+2. **AI 握手**：只测 CF 托管域名（openai/groq/mistral/openrouter）
+3. **Proxy 标记**：ip-api 的 `proxy` 字段，true 则 ×0.9 软降权
+
+### /24 分散（v2.5）
+
+每 /24 最多 5 个，至少 4 个网段。GFW 惩罚精确到单 IP，但情报是关联的——别把鸡蛋放一个篮子。
+
+### SNI 健康检查（v2.7）
+
+`--sni` 支持逗号分隔多值，Top 10 自动测每个 SNI 的 TLS 握手，一眼看出哪个 SNI 被针对。
+
+### 场景化评分（v2.6）
+
+```bash
+--scene=ai     # 延迟+零丢包优先（AI API 流式场景）
+--scene=video  # 带宽优先
+--scene=web    # 通用均衡（默认）
+--scene=general
+```
+
+AI 场景下，5Mbps 零丢包 > 100Mbps 偶发丢包。
+
+### 晚高峰复测（v2.9）
+
+```bash
+--evening  # Top 10 轻量 TCP 复测，标记高峰降级 IP
+```
+
+白天测的好 IP，晚上可能降级。21-23 点跑这个。
+
+## 参数全表
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--count` | 300 | 每协议栈采样数 |
+| `--top` | 20 | 取 Top N |
+| `--scene` | general | ai/web/video/general |
+| `--sni` | speed.cloudflare.com | 测试 SNI，逗号分隔多值 |
+| `--evening` | - | 晚高峰复测模式 |
+| `--stability` | 0 | burn-in 轮数（0=跳过） |
+| `--interval` | 60 | burn-in 轮间隔秒数 |
+| `--ai-test` | - | AI 目标握手测试 |
+| `--v4-only` / `--v6-only` | - | 只测 v4/v6 |
+| `--probe-trigger IP` | - | 单 IP 触发器探测 |
+| `--push` | - | 自动 commit+push，带远端 SHA 验证 |
 
 ## 输出
 
-- `best-ips.txt` — 纯 `IP:443` 列表，直接喂给订阅器
-- `best-ips.json` — 完整结果（延迟/速度/colo/归属地）
+- `best-ips.txt` — `IP#v4-SJC` 格式，订阅器自动拉取
+- `best-ips.json` — 完整结果（含评分、分项、SNI 健康）
+- `ip_history.db` — SQLite 历史库（时段/网络/分项全记录）
 
-## 回传流程
+## 自动驾驶
 
 ```bash
-python cf-pick.py
-git add best-ips.txt best-ips.json
-git commit -m "update $(date +%F)"
-git push
+# 手机跑完自动推送
+python cf-pick.py --scene=ai --push
+    ↓
+# 订阅器每 6 小时自动拉取 best-ips.txt → 更新 KV
 ```
 
-订阅器的 GHA 会自动把 `best-ips.txt` 拉进 `manual.txt` 管道。
+`--push` 带远端 SHA 验证，推成功才报成功，不说谎。
+
+### Termux 桌面小部件
+
+```bash
+mkdir -p ~/.shortcuts
+cat > ~/.shortcuts/cf-pick << 'EOF'
+#!/bin/bash
+cd ~/cf-termux-pick
+git pull --rebase -q
+python cf-pick.py --scene=ai --push
+EOF
+chmod +x ~/.shortcuts/cf-pick
+```
+
+桌面添加 Termux:Widget，点一下就跑。
 
 ## 安全红线
 
-- 只扫描 Cloudflare 官方公布的 IPv4 段（白名单写死在代码里），其它输入直接拒绝
+- 只扫描 Cloudflare 官方公布的 IP 段（白名单写死）
 - 只碰 443 端口
-- 测速并发默认 5，省流量
+- 测速并发 2，省流量
+- 不存密钥，不传隐私
 
-## 已验证 / 待验证
+## 版本历史
 
-- ✅ 白名单逻辑（非 CF/国内/非法输入全部拒绝）
-- ✅ 四层漏斗逻辑（mock 测试 5 进 1 出）
-- ✅ 归属地库查询、trace 机制
-- ⏳ 真实 TLS 直连测速需在 Termux 上实测（沙箱出口代理干扰，无法本地验证）
-
-
----
-
-## v2.0（2026-10-15）：双栈 + 稳定性 + GFW 感知
-
-### 为什么做 v2.0
-单次测速好的 IP，经常用一会就断。根因是 GFW 的**残余审查**：
-检测到异常后，对（你的 IP、服务器 IP、端口）三元组持续 120-180 秒注入 RST。
-所以 v2.0 的核心是**测稳定性，不只测速度**。
-
-### 新增功能
-| 功能 | 说明 |
-|---|---|
-| 双栈采样 | v4（15 段）+ v6（7 段），整数范围采样不爆内存 |
-| burn-in | `--stability 5`：5 轮复测，每轮间隔 60s |
-| GFW 感知分类 | `rst_midstream`（传输中被掐）→ 冷却 5 分钟，不是扔掉 |
-| 稳定性评分 | 成功率 × (1 - 变异系数)，0-100 |
-| SQLite 历史库 | `ip_history.db`，时间衰减可靠性（3 天半衰期） |
-| AI 目标感知 | `--ai-test`：测到真实 AI 域名的 TLS 握手 |
-| 触发器探测 | `--probe-trigger IP`：分辨 SNI 敏感还是流量敏感 |
-| v4/v6 对比 | 输出平均稳定性对比 |
-
-### 用法
-```bash
-# 完整流程（推荐）
-python cf-pick.py --stability 5 --ai-test --push
-
-# 只测 v6
-python cf-pick.py --stability 5 --v6-only --push
-
-# 触发器探测（单个 IP）
-python cf-pick.py --probe-trigger 104.16.132.229
-```
-
-### 评分公式
-```
-最终分 = 速度分(0-100, 20MB/s满分) × 0.7 + 稳定分(0-100) × 0.3
-```
+- **v3.0**：历史库 schema 升级（时段/网络/分项）
+- **v2.9**：GeoIP 三级降级，`--evening` 实现
+- **v2.8**：默认 300 采样，移除 xray-verify
+- **v2.7**：多 SNI 支持
+- **v2.6**：L3 batch、L4 早退、`--scene`、`--sni`
+- **v2.5**：/24 分散、CF 托管 AI 目标
+- **v2.4**：智能采样
+- **v2.3**：并发漏斗
+- **v2.2**：去 SJC 锁，纯净度三层
+- **v2.1**：三探针、丢包/抖动评分
+- **v2.0**：双栈、burn-in、GFW 感知
