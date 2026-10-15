@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.6\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.7\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -327,7 +327,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.6\r\n\r\n")
+               f"User-Agent: cf-pick/2.7\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -397,7 +397,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.6\r\n\r\n")
+               f"User-Agent: cf-pick/2.7\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -618,7 +618,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.6\r\n\r\n")
+               f"User-Agent: cf-pick/2.7\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -970,6 +970,25 @@ def xray_verify(ip, sni="speed.cloudflare.com", timeout=10):
         return False
 
 
+def parse_sni_list(sni_arg):
+    """v2.7：解析逗号分隔的 SNI 列表。空→默认。"""
+    if not sni_arg:
+        return [SPEED_SNI]
+    return [s.strip() for s in sni_arg.split(",") if s.strip()] or [SPEED_SNI]
+
+
+def sni_health_check(ip, sni_list, timeout=8):
+    """v2.7：对 IP 测试多个 SNI 的 TLS 握手健康度。
+
+    返回 {sni: ok}。用于发现被 GFW 针对的 SNI。
+    """
+    out = {}
+    for sni in sni_list:
+        ok, _, _ = tls_handshake(ip, sni, timeout=timeout)
+        out[sni] = ok
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
@@ -1235,6 +1254,21 @@ def main():
 
     final = diversify(final)
 
+    # v2.7：多 SNI 健康检查（如果用户提供了多个 SNI）
+    sni_list = parse_sni_list(args.sni)
+    if len(sni_list) > 1 and final:
+        print(f"\n{'='*50}\nSNI 健康检查（{len(sni_list)} 个 SNI，Top {min(10, len(final))}）\n{'='*50}")
+        for x in final[:10]:
+            health = sni_health_check(x["ip"], sni_list)
+            ok_n = sum(1 for v in health.values() if v)
+            x["sni_ok"] = ok_n
+            x["sni_total"] = len(sni_list)
+            mark = "✅" if ok_n == len(sni_list) else f"⚠️{ok_n}/{len(sni_list)}"
+            print(f"  {x['ip']} {mark}")
+            if ok_n < len(sni_list):
+                bad = [s for s, ok in health.items() if not ok]
+                print(f"    失败 SNI：{', '.join(bad[:3])}")
+
     # v2.6：Xray 隧道验证（可选，只对 Top N 做二值可用性检查）
     if args.xray_verify and final:
         print(f"\n{'='*50}\nXray 隧道验证（Top {min(10, len(final))}）\n{'='*50}")
@@ -1260,13 +1294,13 @@ def main():
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "2.6",
+                   "version": "2.7",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.6")
+        git_auto_push(len(final), args.colo, carrier, extra="v2.7")
 
 
 if __name__ == "__main__":
