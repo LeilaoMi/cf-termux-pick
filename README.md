@@ -27,7 +27,7 @@ python cf-pick.py --scene=ai --evening --push
 |---|---|---|
 | L1 TCP 3探针 | 20 | 最便宜，手机安全值 |
 | L2 TLS trace | 10 | 耗 CPU，防自干扰 |
-| L3 Geo 检查 | 5 | ip-api 限流 45/分钟 |
+| L3 Geo 检查 | 5 | 默认跳过，`--geo` 开启 |
 | L4 测速 | 2 | 最耗流量 |
 
 100 采样约 40 秒，300 采样约 2 分钟。
@@ -85,11 +85,13 @@ AI 场景下，5Mbps 零丢包 > 100Mbps 偶发丢包。
 | `--ai-test` | - | AI 目标握手测试 |
 | `--v4-only` / `--v6-only` | - | 只测 v4/v6 |
 | `--probe-trigger IP` | - | 单 IP 触发器探测 |
+| `--geo` | - | 开启 Geo 归属地检查（默认跳过） |
+| `--port` | 443 | 写入订阅的端口 |
 | `--push` | - | 自动 commit+push，带远端 SHA 验证 |
 
 ## 输出
 
-- `best-ips.txt` — `IP#v4-SJC` 格式，订阅器自动拉取
+- `best-ips.txt` — `IP:443#CU-SJC-170ms-3.1MB` 格式（IPv6 带方括号），preferred-sub-generator 自动拉取；`-low` = 低速兜底，`-old` = 上次结果复用
 - `best-ips.json` — 完整结果（含评分、分项、SNI 健康）
 - `ip_history.db` — SQLite 历史库（时段/网络/分项全记录）
 
@@ -128,6 +130,7 @@ chmod +x ~/.shortcuts/cf-pick
 
 ## 版本历史
 
+- **v3.2**：测速修复（10MB + Referer + 状态码诊断）、L4 按丢包/延迟排序取 30、动态门槛 0.3 MB/s + 兜底、Geo 默认跳过、输出订阅标准格式、不足 10 个用上次结果补齐
 - **v3.0**：历史库 schema 升级（时段/网络/分项）
 - **v2.9**：GeoIP 三级降级，`--evening` 实现
 - **v2.8**：默认 300 采样，移除 xray-verify
