@@ -1,388 +1,127 @@
 {
-  "colo": null,
   "carrier": "CU",
-  "version": "2.4",
-  "updated": "2026-10-15T12:02:32",
+  "version": "2.7",
+  "updated": "2026-10-15T12:32:52",
   "ips": [
     {
-      "ip": "104.17.156.36",
+      "ip": "104.17.156.127",
       "family": 4,
-      "latency_ms": 177.0,
+      "latency_ms": 164.7,
       "loss_pct": 0.0,
-      "jitter_ms": 6.5,
-      "mbps": 6.97,
+      "jitter_ms": 3.0,
+      "mbps": 2.75,
       "country": "Canada",
       "colo": "SJC",
+      "is_proxy": false,
       "ai_targets": {
         "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
+        "api.groq.com": true,
+        "api.mistral.ai": false,
+        "openrouter.ai": true
       },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 6.97
+      "ai_ok": 2,
+      "abuse_clean": true,
+      "abuse_detail": "clean",
+      "final_score": 92.2,
+      "sni_ok": 9,
+      "sni_total": 10,
+      "xray_ok": false
     },
     {
-      "ip": "104.17.156.223",
+      "ip": "104.17.156.167",
       "family": 4,
-      "latency_ms": 197.8,
-      "loss_pct": 0.0,
-      "jitter_ms": 18.7,
-      "mbps": 3.72,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.72
-    },
-    {
-      "ip": "104.17.156.226",
-      "family": 4,
-      "latency_ms": 185.5,
-      "loss_pct": 0.0,
-      "jitter_ms": 7.9,
-      "mbps": 3.57,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.57
-    },
-    {
-      "ip": "104.17.156.163",
-      "family": 4,
-      "latency_ms": 191.9,
-      "loss_pct": 0.0,
-      "jitter_ms": 7.3,
-      "mbps": 3.43,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.43
-    },
-    {
-      "ip": "104.17.156.25",
-      "family": 4,
-      "latency_ms": 187.2,
-      "loss_pct": 0.0,
-      "jitter_ms": 8.4,
-      "mbps": 3.37,
-      "country": "?",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.37
-    },
-    {
-      "ip": "104.17.156.112",
-      "family": 4,
-      "latency_ms": 170.7,
-      "loss_pct": 0.0,
-      "jitter_ms": 5.8,
-      "mbps": 3.29,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.29
-    },
-    {
-      "ip": "104.17.156.166",
-      "family": 4,
-      "latency_ms": 193.3,
-      "loss_pct": 0.0,
-      "jitter_ms": 11.7,
-      "mbps": 3.29,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.29
-    },
-    {
-      "ip": "104.17.156.122",
-      "family": 4,
-      "latency_ms": 188.7,
-      "loss_pct": 0.0,
-      "jitter_ms": 7.1,
-      "mbps": 3.29,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.29
-    },
-    {
-      "ip": "104.17.156.113",
-      "family": 4,
-      "latency_ms": 174.5,
+      "latency_ms": 169.4,
       "loss_pct": 0.0,
       "jitter_ms": 3.4,
-      "mbps": 3.28,
+      "mbps": 3.07,
       "country": "Canada",
       "colo": "SJC",
+      "is_proxy": false,
       "ai_targets": {
         "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
+        "api.groq.com": true,
+        "api.mistral.ai": false,
+        "openrouter.ai": true
       },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.28
+      "ai_ok": 2,
+      "abuse_clean": true,
+      "abuse_detail": "clean",
+      "final_score": 92.0,
+      "sni_ok": 9,
+      "sni_total": 10,
+      "xray_ok": false
     },
     {
-      "ip": "104.17.156.216",
+      "ip": "104.17.156.145",
       "family": 4,
-      "latency_ms": 177.1,
+      "latency_ms": 174.6,
       "loss_pct": 0.0,
-      "jitter_ms": 4.3,
-      "mbps": 3.28,
-      "country": "?",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.28
-    },
-    {
-      "ip": "104.17.156.37",
-      "family": 4,
-      "latency_ms": 196.1,
-      "loss_pct": 0.0,
-      "jitter_ms": 5.6,
-      "mbps": 3.26,
+      "jitter_ms": 2.0,
+      "mbps": 3.17,
       "country": "Canada",
       "colo": "SJC",
+      "is_proxy": false,
       "ai_targets": {
         "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
+        "api.groq.com": true,
+        "api.mistral.ai": false,
+        "openrouter.ai": true
       },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.26
-    },
-    {
-      "ip": "104.17.156.7",
-      "family": 4,
-      "latency_ms": 185.4,
-      "loss_pct": 0.0,
-      "jitter_ms": 5.7,
-      "mbps": 3.2,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.2
-    },
-    {
-      "ip": "104.17.156.202",
-      "family": 4,
-      "latency_ms": 195.8,
-      "loss_pct": 0.0,
-      "jitter_ms": 9.5,
-      "mbps": 3.18,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.18
-    },
-    {
-      "ip": "104.17.156.233",
-      "family": 4,
-      "latency_ms": 171.7,
-      "loss_pct": 0.0,
-      "jitter_ms": 2.7,
-      "mbps": 3.02,
-      "country": "?",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 3.02
+      "ai_ok": 2,
+      "abuse_clean": true,
+      "abuse_detail": "clean",
+      "final_score": 91.9,
+      "sni_ok": 10,
+      "sni_total": 10,
+      "xray_ok": false
     },
     {
       "ip": "104.17.156.208",
       "family": 4,
-      "latency_ms": 188.0,
+      "latency_ms": 175.0,
       "loss_pct": 0.0,
-      "jitter_ms": 8.2,
-      "mbps": 2.99,
+      "jitter_ms": 0.8,
+      "mbps": 3.02,
       "country": "Canada",
       "colo": "SJC",
+      "is_proxy": false,
       "ai_targets": {
         "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
+        "api.groq.com": true,
+        "api.mistral.ai": false,
+        "openrouter.ai": true
       },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.99
+      "ai_ok": 2,
+      "abuse_clean": true,
+      "abuse_detail": "clean",
+      "final_score": 91.9,
+      "sni_ok": 10,
+      "sni_total": 10,
+      "xray_ok": false
     },
     {
-      "ip": "104.17.156.116",
+      "ip": "104.17.156.55",
       "family": 4,
-      "latency_ms": 185.9,
+      "latency_ms": 171.3,
       "loss_pct": 0.0,
-      "jitter_ms": 7.8,
-      "mbps": 2.97,
-      "country": "?",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.97
-    },
-    {
-      "ip": "104.17.156.64",
-      "family": 4,
-      "latency_ms": 178.0,
-      "loss_pct": 0.0,
-      "jitter_ms": 4.3,
-      "mbps": 2.93,
+      "jitter_ms": 2.0,
+      "mbps": 2.81,
       "country": "Canada",
       "colo": "SJC",
+      "is_proxy": false,
       "ai_targets": {
         "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
+        "api.groq.com": true,
+        "api.mistral.ai": false,
+        "openrouter.ai": true
       },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.93
-    },
-    {
-      "ip": "104.17.156.10",
-      "family": 4,
-      "latency_ms": 182.7,
-      "loss_pct": 0.0,
-      "jitter_ms": 6.4,
-      "mbps": 2.87,
-      "country": "?",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.87
-    },
-    {
-      "ip": "104.17.156.189",
-      "family": 4,
-      "latency_ms": 176.5,
-      "loss_pct": 0.0,
-      "jitter_ms": 6.8,
-      "mbps": 2.72,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.72
-    },
-    {
-      "ip": "104.17.156.39",
-      "family": 4,
-      "latency_ms": 193.6,
-      "loss_pct": 0.0,
-      "jitter_ms": 9.9,
-      "mbps": 2.64,
-      "country": "Canada",
-      "colo": "SJC",
-      "ai_targets": {
-        "api.openai.com": false,
-        "api.anthropic.com": true,
-        "generativelanguage.googleapis.com": false
-      },
-      "ai_ok": 1,
-      "abuse_clean": null,
-      "abuse_detail": "check_failed: <urlopen error [Errno 111] Connection re",
-      "final_score": 2.64
+      "ai_ok": 2,
+      "abuse_clean": true,
+      "abuse_detail": "clean",
+      "final_score": 91.9,
+      "sni_ok": 9,
+      "sni_total": 10,
+      "xray_ok": false
     }
   ]
 }
