@@ -74,20 +74,88 @@ DB_PATH = "ip_history.db"
 
 # ---------------------------------------------------------------- 基础工具
 
-def sample_ips(family, count):
-    """整数范围随机采样（不枚举，避免大网段内存爆炸）。"""
+def get_good_neighborhoods(conn, family=4, min_score=60, days=7, limit=20):
+    """从历史库提取优质 /24 网段（v2.4 智能采样）。
+
+    返回 [(network_str, weight)]，按加权成功率排序。
+    zqy857 邻域加权思想：出过好 IP 的 C 段优先。
+    """
+    import time as _t
+    cutoff = _t.time() - days * 86400
+    rows = conn.execute(
+        """SELECT ip, mbps, ok FROM history
+           WHERE family=? AND ts>? AND mbps > 0""",
+        (family, cutoff)).fetchall()
+    if not rows:
+        return []
+    # 按 /24 聚合
+    from collections import defaultdict
+    nets = defaultdict(lambda: {"ok": 0, "total": 0, "mbps_sum": 0.0})
+    for ip, mbps, ok in rows:
+        try:
+            net = str(ipaddress.ip_network(ip + "/24", strict=False))
+            nets[net]["total"] += 1
+            nets[net]["mbps_sum"] += mbps or 0
+            if ok:
+                nets[net]["ok"] += 1
+        except Exception:
+            continue
+    scored = []
+    for net, d in nets.items():
+        if d["total"] < 2:
+            continue  # 样本太少不信
+        rate = d["ok"] / d["total"]
+        avg_mbps = d["mbps_sum"] / d["total"]
+        # 权重 = 成功率 × 速度因子
+        w = rate * min(avg_mbps / 10.0, 1.0)
+        if w > 0.3:  # 阈值
+            scored.append((net, w))
+    scored.sort(key=lambda x: -x[1])
+    return scored[:limit]
+
+
+def sample_ips(family, count, conn=None, exploit_ratio=0.6):
+    """整数范围随机采样（v2.4：60% 优质邻域 + 40% 随机探索）。
+
+    conn=None 时退化为纯随机（冷启动）。
+    """
     ranges = CF_V4 if family == 4 else CF_V6
     out = set()
-    nets = [ipaddress.ip_network(c) for c in ranges]
-    # 按地址空间大小加权
+
+    # 智能部分：从优质 /24 里采样
+    smart_count = 0
+    if conn is not None and family == 4:  # v6 暂不做邻域（地址空间太大）
+        neighborhoods = get_good_neighborhoods(conn, family)
+        if neighborhoods:
+            smart_target = int(count * exploit_ratio)
+            nets = [ipaddress.ip_network(n) for n, _ in neighborhoods]
+            weights = [w for _, w in neighborhoods]
+            total_w = sum(weights)
+            while len(out) < smart_target:
+                r = random.uniform(0, total_w)
+                for net, w in zip(nets, weights):
+                    r -= w
+                    if r <= 0:
+                        # /24 内随机取一个 host
+                        base = int(net.network_address)
+                        ip_int = base + random.randint(1, 254)
+                        out.add(str(ipaddress.ip_address(ip_int)))
+                        break
+            smart_count = len(out)
+            print(f"  智能采样：{smart_count} 个（来自 {len(neighborhoods)} 个优质 /24）")
+
+    # 随机部分：补足剩余
+    nets = [ipaddress.ip_network(cidr) for cidr in ranges]
     weights = [n.num_addresses for n in nets]
     total = sum(weights)
-    while len(out) < count:
+    target = count - len(out)
+    guard = 0
+    while len(out) < count and guard < count * 10:
+        guard += 1
         r = random.uniform(0, total)
         for net, w in zip(nets, weights):
             r -= w
             if r <= 0:
-                # 随机取网段内一个地址（跳过网络地址和广播地址）
                 lo = int(net.network_address) + 1
                 hi = int(net.broadcast_address) - 1
                 if family == 6:
@@ -95,6 +163,8 @@ def sample_ips(family, count):
                 ip_int = random.randint(lo, hi)
                 out.add(str(ipaddress.ip_address(ip_int)))
                 break
+    if smart_count:
+        print(f"  随机探索：{len(out) - smart_count} 个")
     return list(out)
 
 
@@ -159,7 +229,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.3\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.4\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -214,7 +284,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.3\r\n\r\n")
+               f"User-Agent: cf-pick/2.4\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -271,7 +341,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.3\r\n\r\n")
+               f"User-Agent: cf-pick/2.4\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -491,7 +561,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.3\r\n\r\n")
+               f"User-Agent: cf-pick/2.4\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -696,11 +766,11 @@ def _l3_geo(args):
     return (ip, lat, loss, jitter, colo, country)
 
 
-def phase1_funnel(family, count, top_n, sni=SPEED_SNI):
-    """Phase 1：并发快漏斗（v2.3）。返回候选列表。"""
+def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
+    """Phase 1：并发快漏斗（v2.4 智能采样）。返回候选列表。"""
     fam_name = f"IPv{'6' if family == 6 else '4'}"
     print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 并发漏斗\n{'='*50}")
-    ips = sample_ips(family, count)
+    ips = sample_ips(family, count, conn)
     print(f"采样 {len(ips)} 个")
 
     # L1: 并发 TCP 3探针
@@ -822,11 +892,16 @@ def main():
         print("❌ 没有可用的协议栈")
         sys.exit(1)
 
+    # 历史库提前初始化（供智能采样用）
+    _conn_early = init_db()
+
     # Phase 1
     all_candidates = []
     for fam in families:
-        cands = phase1_funnel(fam, args.count, args.top)
+        cands = phase1_funnel(fam, args.count, args.top, conn=_conn_early)
         all_candidates.extend(cands)
+
+    _conn_early.close()
 
     if not all_candidates:
         print("❌ 漏斗无结果")
@@ -972,7 +1047,7 @@ def main():
             f.write(f"{c['ip']}#v{c['family']}-{args.colo}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"colo": args.colo, "carrier": carrier,
-                   "version": "2.3",
+                   "version": "2.4",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
