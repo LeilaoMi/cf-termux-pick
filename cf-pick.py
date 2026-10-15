@@ -520,6 +520,16 @@ def git_auto_push(top_count, colo, carrier="?", extra=""):
     def run(cmd, timeout=60):
         return subprocess.run(cmd, capture_output=True, timeout=timeout)
 
+    # 先确认在 git 仓库里（否则后面的空输出会被误判为"无变化"）
+    try:
+        top = run(["git", "rev-parse", "--show-toplevel"], timeout=10)
+        if top.returncode != 0:
+            print("⚠️ 当前目录不是 git 仓库，跳过 push")
+            return False
+    except Exception:
+        print("⚠️ git 不可用，跳过 push")
+        return False
+
     try:
         r = run(["git", "config", "user.email"], timeout=10)
         if r.returncode != 0 or not r.stdout.strip():
@@ -544,6 +554,9 @@ def git_auto_push(top_count, colo, carrier="?", extra=""):
     try:
         st = run(["git", "status", "--porcelain", "best-ips.txt", "best-ips.json"],
                  timeout=30)
+        if st.returncode != 0:
+            print("⚠️ git status 失败")
+            return False
         if not st.stdout.strip():
             print("ℹ️ 结果无变化，跳过 push")
             return True
@@ -557,12 +570,34 @@ def git_auto_push(top_count, colo, carrier="?", extra=""):
             err = cm.stderr.decode("utf-8", "ignore")[:200]
             print(f"⚠️ git commit 失败：{err}")
             return False
+        local_sha = run(["git", "rev-parse", "HEAD"],
+                        timeout=10).stdout.decode().strip()[:8]
+        print(f"ℹ️ 本地 commit：{local_sha}")
+
         push = run(["git", "push"], timeout=120)
-        if push.returncode == 0:
-            print("✅ 已自动 push 到仓库")
+        if push.returncode != 0:
+            err = push.stderr.decode("utf-8", "ignore")[:200]
+            print(f"⚠️ push 失败：{err}")
+            print("  请手动执行：git push")
+            return False
+
+        # 自证：fetch 后对比远端 SHA，不一致就是没推上去
+        run(["git", "fetch", "origin"], timeout=30)
+        # 找当前分支的上游
+        up = run(["git", "rev-parse", "--abbrev-ref",
+                  "--symbolic-full-name", "@{u}"], timeout=10)
+        upstream = up.stdout.decode().strip() if up.returncode == 0 else "origin/main"
+        remote_sha = run(["git", "rev-parse", upstream],
+                         timeout=10).stdout.decode().strip()[:8]
+        local_full = run(["git", "rev-parse", "HEAD"],
+                         timeout=10).stdout.decode().strip()[:8]
+        if local_full == remote_sha:
+            print(f"✅ 已 push 到仓库（远端已验证：{remote_sha}）")
             return True
-        err = push.stderr.decode("utf-8", "ignore")[:200]
-        print(f"⚠️ push 失败：{err}")
+        else:
+            print(f"⚠️ push 返回成功，但远端 SHA({remote_sha})≠本地({local_full})，实际没推上去")
+            print("  请手动执行：git push")
+            return False
     except Exception as e:
         print(f"⚠️ push 异常：{e}")
     print("  请手动执行：git push")
