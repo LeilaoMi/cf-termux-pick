@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.7\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.8\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -327,7 +327,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.7\r\n\r\n")
+               f"User-Agent: cf-pick/2.8\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -397,7 +397,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.7\r\n\r\n")
+               f"User-Agent: cf-pick/2.8\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -618,7 +618,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.7\r\n\r\n")
+               f"User-Agent: cf-pick/2.8\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -899,77 +899,6 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
     return top
 
 
-def xray_verify(ip, sni="speed.cloudflare.com", timeout=10):
-    """v2.6：用 Xray 真实隧道验证 IP 可用性。
-
-    只做二值判断（能/不能），不测速。
-    需要 Termux 装好 xray 二进制。
-    返回 True/False。
-    """
-    import subprocess, tempfile, os
-    # 最小 VLESS 配置（只验证连通性）
-    config = {
-        "inbounds": [{
-            "port": 10809, "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": False}
-        }],
-        "outbounds": [{
-            "protocol": "vless",
-            "settings": {"vnext": [{
-                "address": ip, "port": 443,
-                "users": [{"id": "00000000-0000-0000-0000-000000000000",
-                           "encryption": "none"}]
-            }]},
-            "streamSettings": {
-                "network": "tcp",
-                "security": "tls",
-                "tlsSettings": {"serverName": sni, "allowInsecure": True}
-            }
-        }]
-    }
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
-                                         delete=False) as f:
-            json.dump(config, f)
-            cfg_path = f.name
-        # 启动 xray
-        proc = subprocess.Popen(
-            ["xray", "run", "-c", cfg_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)  # 等待启动
-        try:
-            # 通过 SOCKS 代理请求 generate_204
-            import socket as sk
-            s = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.connect(("127.0.0.1", 10809))
-            # SOCKS5 握手
-            s.sendall(b"\x05\x01\x00")
-            resp = s.recv(2)
-            if resp != b"\x05\x00":
-                return False
-            # 连接 generate_204
-            host = "www.google.com"
-            req = b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
-            req += b"\x00\x50"
-            s.sendall(req)
-            resp = s.recv(10)
-            if resp[1] != 0:
-                return False
-            # 发 HTTP 请求
-            s.sendall(b"GET http://www.google.com/generate_204 HTTP/1.1\r\n"
-                      b"Host: www.google.com\r\n\r\n")
-            data = s.recv(1024)
-            s.close()
-            return b"204" in data
-        finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            os.unlink(cfg_path)
-    except Exception:
-        return False
-
-
 def parse_sni_list(sni_arg):
     """v2.7：解析逗号分隔的 SNI 列表。空→默认。"""
     if not sni_arg:
@@ -993,7 +922,7 @@ def main():
     ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
-    ap.add_argument("--count", type=int, default=100,
+    ap.add_argument("--count", type=int, default=300,
                     help="每协议栈采样数")
     ap.add_argument("--top", type=int, default=20,
                     help="每协议栈取 Top N 进 burn-in")
@@ -1012,8 +941,7 @@ def main():
                     help="场景：ai=延迟+零丢包优先，video=带宽优先")
     ap.add_argument("--sni", default=None,
                     help="测试用 SNI（默认 speed.cloudflare.com），填节点真实 SNI 更准")
-    ap.add_argument("--xray-verify", action="store_true",
-                    help="对 Top N 用 Xray 真实隧道验证（需装 xray）")
+    # --xray-verify 已在 v2.8 移除（需真实 UUID，SNI 健康检查已覆盖 80% 价值）
     ap.add_argument("--evening", action="store_true",
                     help="晚高峰复测模式：只对历史 top 做轻量复测")
     ap.add_argument("--push", action="store_true")
@@ -1269,38 +1197,19 @@ def main():
                 bad = [s for s, ok in health.items() if not ok]
                 print(f"    失败 SNI：{', '.join(bad[:3])}")
 
-    # v2.6：Xray 隧道验证（可选，只对 Top N 做二值可用性检查）
-    if args.xray_verify and final:
-        print(f"\n{'='*50}\nXray 隧道验证（Top {min(10, len(final))}）\n{'='*50}")
-        sni = args.sni or SPEED_SNI
-        verified = []
-        for x in final[:10]:
-            ok = xray_verify(x["ip"], sni=sni)
-            x["xray_ok"] = ok
-            mark = "✅" if ok else "❌"
-            print(f"  {x['ip']} {mark}")
-            if ok:
-                verified.append(x)
-        if verified:
-            print(f"  → {len(verified)}/{min(10, len(final))} 通过隧道验证")
-            # 隧道验证通过的排前面
-            final = verified + [x for x in final if not x.get("xray_ok")]
-        else:
-            print("  ⚠️ 全部未通过，保留原排名（可能是配置问题）")
-
     # 写文件（v4/v6 标注 + 真实 colo）
     with open("best-ips.txt", "w") as f:
         for x in final:
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "2.7",
+                   "version": "2.8",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.7")
+        git_auto_push(len(final), args.colo, carrier, extra="v2.8")
 
 
 if __name__ == "__main__":
