@@ -305,6 +305,46 @@ async def layer4_speed(candidates, concurrency):
 # 主流程
 # ---------------------------------------------------------------------------
 
+def git_auto_push(top_count, colo):
+    """跑完自动 git add/commit/push。失败不抛异常，只打印手动命令。"""
+    import subprocess
+
+    def run(cmd, timeout=60):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+    try:
+        run(["git", "add", "best-ips.txt", "best-ips.json"], timeout=30)
+    except FileNotFoundError:
+        print("⚠️ 没找到 git，请手动 push")
+        return False
+    except Exception as e:
+        print(f"⚠️ git add 失败：{e}")
+        return False
+
+    # 没变化就不提交
+    try:
+        st = run(["git", "status", "--porcelain", "best-ips.txt", "best-ips.json"], timeout=30)
+        if not st.stdout.strip():
+            print("ℹ️ 结果无变化，跳过 push")
+            return True
+    except Exception:
+        pass
+
+    msg = f"update {time.strftime('%Y-%m-%d %H:%M')}: {top_count} IPs ({colo})"
+    try:
+        run(["git", "commit", "-m", msg], timeout=30)
+        push = run(["git", "push"], timeout=120)
+        if push.returncode == 0:
+            print("✅ 已自动 push 到仓库")
+            return True
+        err = push.stderr.decode("utf-8", "ignore")[:200]
+        print(f"⚠️ push 失败：{err}")
+    except Exception as e:
+        print(f"⚠️ push 异常：{e}")
+    print("  请手动执行：git push")
+    return False
+
+
 async def main_async(args):
     print(f"cf-pick v1.0 | 目标 colo={args.colo} | Top {args.top}")
     print(f"白名单：{len(CF_IPV4_RANGES)} 个 CF 官方段")
@@ -370,6 +410,9 @@ async def main_async(args):
     for ip, ms, colo, cc, mbps in top:
         print(f"  {ip}:443  {ms}ms  {colo}  {cc}  {mbps}Mbps")
 
+    if args.push:
+        git_auto_push(len(top), args.colo)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Termux 上的 CF 优选 IP 扫描器")
@@ -383,6 +426,8 @@ def main():
                     help="测速并发（默认 5，省流量）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只采样不测试")
+    ap.add_argument("--push", action="store_true",
+                    help="跑完自动 git add/commit/push 回传仓库")
     args = ap.parse_args()
     try:
         asyncio.run(main_async(args))
