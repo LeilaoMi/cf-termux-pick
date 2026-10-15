@@ -1,0 +1,35 @@
+{
+  "colo": "SJC",
+  "carrier": "CU",
+  "version": "2.0",
+  "updated": "2026-10-15T11:16:31",
+  "ips": [
+    {
+      "ip": "104.17.147.195",
+      "family": 4,
+      "latency_ms": 254.9,
+      "mbps": 6.69,
+      "country": "Canada",
+      "colo": "SJC",
+      "final_score": 6.69
+    },
+    {
+      "ip": "104.17.136.152",
+      "family": 4,
+      "latency_ms": 213.1,
+      "mbps": 3.39,
+      "country": "Canada",
+      "colo": "SJC",
+      "final_score": 3.39
+    },
+    {
+      "ip": "104.17.156.139",
+      "family": 4,
+      "latency_ms": 213.5,
+      "mbps": 2.24,
+      "country": "Canada",
+      "colo": "SJC",
+      "final_score": 2.24
+    }
+  ]
+}
