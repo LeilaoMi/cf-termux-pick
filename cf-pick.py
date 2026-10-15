@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.8\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.9\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -275,14 +275,15 @@ def check_geo(ip, timeout=10):
 
 def check_geo_batch(ips, timeout=15):
     """v2.6：ip-api.com /batch 接口，一次 POST 查 100 个 IP。
+    v2.9：三级降级 ip-api → ipwho.is → db-ip.com。
 
     返回 {ip: (is_cn, country, is_proxy)}。
-    免费版 15 batches/分钟，读 X-Rl 头做限流。
     """
     if not ips:
         return {}
     out = {}
-    # 每批最多 100
+    # 第一级：ip-api.com batch
+    remaining = list(ips)
     for i in range(0, len(ips), 100):
         batch = ips[i:i+100]
         try:
@@ -297,19 +298,44 @@ def check_geo_batch(ips, timeout=15):
                 headers={"Content-Type": "application/json"},
                 method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                # 读限流头
-                rl = r.headers.get("X-Rl", "?")
                 arr = json.load(r)
             for q, d in zip(batch, arr):
                 if isinstance(d, dict) and d.get("status") == "success":
                     cc = d.get("countryCode", "?")
                     out[q] = ((cc == "CN"), d.get("country", "?"),
                               bool(d.get("proxy", False)))
-                else:
-                    out[q] = (False, "?", False)
+                    if q in remaining:
+                        remaining.remove(q)
         except Exception:
-            for q in batch:
-                out.setdefault(q, (False, "?", False))
+            pass
+    # 第二级：ipwho.is（单个查，无 proxy 字段）
+    for ip in remaining[:]:
+        try:
+            url = f"http://ipwho.is/{ip}"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                d = json.load(r)
+            if d.get("success"):
+                cc = d.get("country_code", "?")
+                out[ip] = ((cc == "CN"), d.get("country", "?"), False)
+                remaining.remove(ip)
+        except Exception:
+            pass
+    # 第三级：db-ip.com（单个查）
+    for ip in remaining[:]:
+        try:
+            url = f"https://api.db-ip.com/v2/free/{ip}"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                d = json.load(r)
+            cc = d.get("countryCode", "?")
+            out[ip] = ((cc == "CN"), d.get("countryName", "?"), False)
+            remaining.remove(ip)
+        except Exception:
+            pass
+    # 全部失败的不阻塞
+    for ip in remaining:
+        out.setdefault(ip, (False, "?", False))
+    if remaining:
+        print(f"  ⚠️ {len(remaining)} 个 IP Geo 查询全失败，不阻塞")
     return out
 
 
@@ -327,7 +353,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.8\r\n\r\n")
+               f"User-Agent: cf-pick/2.9\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -397,7 +423,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.8\r\n\r\n")
+               f"User-Agent: cf-pick/2.9\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -618,7 +644,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.8\r\n\r\n")
+               f"User-Agent: cf-pick/2.9\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -1182,6 +1208,42 @@ def main():
 
     final = diversify(final)
 
+    # v2.9：--evening 晚高峰复测（只对 Top N 做 TCP+抖动轻量复测）
+    if args.evening and final:
+        import datetime
+        hour = datetime.datetime.now().hour
+        is_peak = 20 <= hour <= 23
+        print(f"\n{'='*50}\n晚高峰复测（当前 {hour} 点，"
+              f"{'高峰' if is_peak else '非高峰'}）\n{'='*50}")
+        for x in final[:10]:
+            # 轻量：3 探针 TCP
+            lats = []
+            for _ in range(3):
+                lat = tcp_ping(x["ip"], timeout=2)
+                if lat:
+                    lats.append(lat)
+                time.sleep(0.1)
+            if lats:
+                import statistics
+                new_lat = max(lats) * 1000
+                new_jit = (statistics.pstdev(lats) * 1000
+                           if len(lats) > 1 else 0)
+                old_lat = x["latency_ms"]
+                # 高峰降级超过 50% 则标记
+                if new_lat > old_lat * 1.5:
+                    x["peak_degraded"] = True
+                    print(f"  {x['ip']} ⚠️ 高峰降级：{old_lat:.0f}→{new_lat:.0f}ms")
+                else:
+                    x["peak_degraded"] = False
+                    print(f"  {x['ip']} ✅ 高峰稳定：{new_lat:.0f}ms")
+                x["peak_latency_ms"] = round(new_lat, 1)
+            else:
+                x["peak_degraded"] = True
+                print(f"  {x['ip']} ❌ 高峰不可达")
+        # 降级的排后面
+        final.sort(key=lambda x: (x.get("peak_degraded", False),
+                                  -x.get("final_score", 0)))
+
     # v2.7：多 SNI 健康检查（如果用户提供了多个 SNI）
     sni_list = parse_sni_list(args.sni)
     if len(sni_list) > 1 and final:
@@ -1203,13 +1265,13 @@ def main():
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "2.8",
+                   "version": "2.9",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.8")
+        git_auto_push(len(final), args.colo, carrier, extra="v2.9")
 
 
 if __name__ == "__main__":
