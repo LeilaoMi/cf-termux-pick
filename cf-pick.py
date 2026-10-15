@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------- 配置
 
@@ -50,6 +51,12 @@ CF_V6 = [
 
 # GFW 残余审查时长：学术实测 120-180 秒，冷却取 300 秒保底
 GFW_COOLDOWN = 300
+
+# v2.3 并发配置（手机安全值）
+CONC_L1 = 20  # TCP 握手：最便宜
+CONC_L2 = 10  # TLS trace：耗 CPU
+CONC_L3 = 5   # Geo API：ip-api 限流 45/分钟
+CONC_L4 = 2   # 测速：最耗流量
 
 # 测速目标
 SPEED_URL_PATH = "/__down"
@@ -152,7 +159,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.2\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.3\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -207,7 +214,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.2\r\n\r\n")
+               f"User-Agent: cf-pick/2.3\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -264,7 +271,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.2\r\n\r\n")
+               f"User-Agent: cf-pick/2.3\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -484,7 +491,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.2\r\n\r\n")
+               f"User-Agent: cf-pick/2.3\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -643,92 +650,123 @@ def git_auto_push(top_count, colo, carrier="?", extra=""):
 
 # ---------------------------------------------------------------- 主流程
 
+def _l1_probe(ip):
+    """L1 单 IP：3 探针，返回 (ip, worst, loss, jitter) 或 None。"""
+    lats = []
+    fails = 0
+    for _ in range(3):
+        lat = tcp_ping(ip, timeout=2)  # v2.3：超时 3→2s，失败更快
+        if lat is None:
+            fails += 1
+        else:
+            lats.append(lat)
+        time.sleep(0.12)
+    if not lats:
+        return None
+    loss = fails / 3.0
+    if loss > 0.5:
+        return None
+    worst = max(lats)
+    if worst >= 1.0:
+        return None
+    jitter = statistics.pstdev(lats) if len(lats) > 1 else 0.0
+    return (ip, worst, loss, jitter)
+
+
+def _l2_trace(args):
+    """L2 单 IP：trace，返回 (ip, lat, loss, jitter, colo, loc) 或 None。"""
+    ip, lat, loss, jitter, sni = args
+    tr = fetch_trace(ip, sni)
+    if not tr or tr.get("_error"):
+        return None
+    if tr.get("_blocked"):
+        return None
+    return (ip, lat, loss, jitter, tr.get("colo", "?"), tr.get("loc", "?"))
+
+
+def _l3_geo(args):
+    """L3 单 IP：Geo 检查，返回 (ip, lat, loss, jitter, colo, country) 或 None。
+
+    v2.3 修复：只用 ip-api 判 IP 归属地，不再用 trace loc（那是客户端位置）。
+    """
+    ip, lat, loss, jitter, colo, _loc = args
+    is_cn, country = check_geo(ip)
+    if is_cn:
+        return None
+    return (ip, lat, loss, jitter, colo, country)
+
+
 def phase1_funnel(family, count, top_n, sni=SPEED_SNI):
-    """Phase 1：采样 → 四层漏斗（v2.2：不再按 colo 过滤，纯净度判别）。返回候选列表。"""
+    """Phase 1：并发快漏斗（v2.3）。返回候选列表。"""
     fam_name = f"IPv{'6' if family == 6 else '4'}"
-    print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 四层漏斗（纯净度）\n{'='*50}")
+    print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 并发漏斗\n{'='*50}")
     ips = sample_ips(family, count)
     print(f"采样 {len(ips)} 个")
 
-    # L1: TCP 3探针（取最差，算丢包率+抖动）— cfnb/Zeus 方法论
+    # L1: 并发 TCP 3探针
     lat_ok = []
-    for ip in ips:
-        lats = []
-        fails = 0
-        for _ in range(3):
-            lat = tcp_ping(ip, timeout=3)
-            if lat is None:
-                fails += 1
-            else:
-                lats.append(lat)
-            time.sleep(0.12)  # Zeus: 120ms 间隔，防热路径掩盖丢包
-        if not lats:
-            continue
-        loss = fails / 3.0
-        if loss > 0.5:
-            continue  # 丢包过半直接扔
-        worst = max(lats)
-        if worst >= 1.0:
-            continue
-        jitter = statistics.pstdev(lats) if len(lats) > 1 else 0.0
-        lat_ok.append((ip, worst, loss, jitter))
-    lat_ok.sort(key=lambda x: (x[2], x[1]))  # 丢包优先，其次延迟
-    print(f"L1 TCP 3探针（丢包≤50%, 延迟<1s）：{len(lat_ok)}")
+    with ThreadPoolExecutor(max_workers=CONC_L1) as ex:
+        futs = {ex.submit(_l1_probe, ip): ip for ip in ips}
+        for fu in as_completed(futs):
+            r = fu.result()
+            if r:
+                lat_ok.append(r)
+    lat_ok.sort(key=lambda x: (x[2], x[1]))
+    print(f"L1 TCP 3探针（{CONC_L1}并发）：{len(lat_ok)}")
     if not lat_ok:
         return []
 
-    # L2: trace 获取（拿 colo+loc，不再硬过滤）— v2.2 纯净度判别
+    # L2: 并发 trace
     colo_ok = []
-    for ip, lat, loss, jitter in lat_ok[:80]:
-        tr = fetch_trace(ip, sni)
-        if not tr or tr.get("_error"):
-            continue
-        # Zeus: 403/409/429 = 可达但拒绝，直接进墓碑
-        if tr.get("_blocked"):
-            continue
-        ip_colo = tr.get("colo", "?")
-        ip_loc = tr.get("loc", "?")
-        colo_ok.append((ip, lat, loss, jitter, ip_colo, ip_loc))
-    print(f"L2 trace 成功：{len(colo_ok)}")
+    with ThreadPoolExecutor(max_workers=CONC_L2) as ex:
+        futs = {ex.submit(_l2_trace, (ip, lat, loss, jit, sni)): ip
+                for ip, lat, loss, jit in lat_ok[:80]}
+        for fu in as_completed(futs):
+            r = fu.result()
+            if r:
+                colo_ok.append(r)
+    print(f"L2 trace（{CONC_L2}并发）：{len(colo_ok)}")
     if not colo_ok:
         return []
 
-    # L3: 纯净度第一层 — Geo 一致性（trace loc vs ip-api）
+    # L3: 并发 Geo（v2.3 修复：只看 IP 归属地）
     geo_ok = []
-    for ip, lat, loss, jitter, ip_colo, ip_loc in colo_ok:
-        is_cn, country = check_geo(ip)
-        # 纯净度判定：两个源都不说 CN，且互相一致（允许一个未知）
-        trace_cn = (ip_loc == "CN")
-        api_cn = is_cn
-        if trace_cn or api_cn:
-            continue  # 任一说 CN → 扔
-        # 一致性：都不为 ? 时必须相同
-        if ip_loc != "?" and country != "?":
-            # ip-api 返回全称（"United States"），trace 返回代码（"US"）
-            # 简化：只要 trace loc 不是 CN 就过（ip-api 已确认非 CN）
-            pass
-        geo_ok.append((ip, lat, loss, jitter, ip_colo, ip_loc, country))
-    print(f"L3 纯净度-Geo一致（双源非CN）：{len(geo_ok)}")
+    with ThreadPoolExecutor(max_workers=CONC_L3) as ex:
+        futs = {ex.submit(_l3_geo, t): t[0] for t in colo_ok}
+        for fu in as_completed(futs):
+            r = fu.result()
+            if r:
+                geo_ok.append(r)
+    print(f"L3 Geo非CN（{CONC_L3}并发）：{len(geo_ok)}")
     if not geo_ok:
         return []
 
-    # L4: 测速
+    # L4: 测速（2 并发，省流量）
     scored = []
-    for ip, lat, loss, jitter, ip_colo, ip_loc, country in geo_ok[:30]:
+    def _speed_task(t):
+        ip, lat, loss, jit, colo, country = t
         mbps = speed_test(ip, sni)
         if mbps > 1.0:
-            scored.append({"ip": ip, "family": family,
-                           "latency_ms": round(lat * 1000, 1),
-                           "loss_pct": round(loss * 100, 1),
-                           "jitter_ms": round(jitter * 1000, 1),
-                           "mbps": round(mbps, 2), "country": country,
-                           "colo": ip_colo, "loc": ip_loc})
+            return {"ip": ip, "family": family,
+                    "latency_ms": round(lat * 1000, 1),
+                    "loss_pct": round(loss * 100, 1),
+                    "jitter_ms": round(jit * 1000, 1),
+                    "mbps": round(mbps, 2), "country": country,
+                    "colo": colo}
+        return None
+
+    with ThreadPoolExecutor(max_workers=CONC_L4) as ex:
+        futs = {ex.submit(_speed_task, t): t[0] for t in geo_ok[:20]}
+        for fu in as_completed(futs):
+            r = fu.result()
+            if r:
+                scored.append(r)
     scored.sort(key=lambda x: -x["mbps"])
     top = scored[:top_n]
-    print(f"L4 测速 >1MB/s：{len(scored)}，取 Top {len(top)}")
-    for c in top:
-        print(f"  {c['ip']} {c['latency_ms']}ms "
-              f"丢包{c['loss_pct']}% 抖动{c['jitter_ms']}ms {c['mbps']}MB/s")
+    print(f"L4 测速（{CONC_L4}并发）：{len(scored)}，取 Top {len(top)}")
+    for t in top:
+        print(f"  {t['ip']} [{t['colo']}] {t['latency_ms']}ms "
+              f"丢包{t['loss_pct']}% {t['mbps']}MB/s")
     return top
 
 
@@ -736,7 +774,7 @@ def main():
     ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
-    ap.add_argument("--count", type=int, default=200,
+    ap.add_argument("--count", type=int, default=100,
                     help="每协议栈采样数")
     ap.add_argument("--top", type=int, default=20,
                     help="每协议栈取 Top N 进 burn-in")
@@ -934,7 +972,7 @@ def main():
             f.write(f"{c['ip']}#v{c['family']}-{args.colo}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"colo": args.colo, "carrier": carrier,
-                   "version": "2.2",
+                   "version": "2.3",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
