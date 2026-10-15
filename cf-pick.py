@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cf-pick.py v2.0 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
+cf-pick.py v3.3 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
 
 Phase 1: 双栈采样 → 四层漏斗（TCP延迟 → colo → 送中过滤 → 测速）
 Phase 2: 稳定性 burn-in（多轮复测，识别 GFW 残余审查模式）
@@ -18,6 +18,7 @@ Phase 4: SQLite 历史库（时间衰减可靠性评分）
 """
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import random
@@ -153,11 +154,28 @@ def sample_ips(family, count, conn=None, exploit_ratio=0.6):
             smart_count = len(out)
             print(f"  智能采样：{smart_count} 个（来自 {len(neighborhoods)} 个优质 /24）")
 
-    # 随机部分：补足剩余
+    # 随机部分：补足剩余。v3.3：IPv4 先在所有 /24 里不放回地均匀抽，再在 /24 内随机取一个 host
+    # （思路同 XIU2 的每 /24 取 1 个），避免 104.16/13、172.64/13 两个大段占满样本、同一 /24 重复抽。
     nets = [ipaddress.ip_network(cidr) for cidr in ranges]
+    need = count - len(out)
+    if family == 4 and need > 0:
+        blocks = []  # (network_int, 该网段里 /24 的个数)
+        for net in nets:
+            n24 = max(1, net.num_addresses // 256)
+            blocks.append((int(net.network_address), n24))
+        total24 = sum(n for _, n in blocks)
+        picked = random.sample(range(total24), min(need * 2, total24))
+        for idx in picked:
+            if len(out) >= count:
+                break
+            for base, n24 in blocks:
+                if idx < n24:
+                    ip_int = base + idx * 256 + random.randint(1, 254)
+                    out.add(str(ipaddress.ip_address(ip_int)))
+                    break
+                idx -= n24
     weights = [n.num_addresses for n in nets]
     total = sum(weights)
-    target = count - len(out)
     guard = 0
     while len(out) < count and guard < count * 10:
         guard += 1
@@ -238,7 +256,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.2\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.3\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -350,7 +368,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
                f"Referer: https://{sni}/\r\n"
-               f"User-Agent: cf-pick/3.2\r\n\r\n")
+               f"User-Agent: cf-pick/3.3\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -429,7 +447,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.2\r\n\r\n")
+               f"User-Agent: cf-pick/3.3\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -698,7 +716,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.2\r\n\r\n")
+               f"User-Agent: cf-pick/3.3\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -727,24 +745,57 @@ def probe_trigger(ip, sni=SPEED_SNI):
 
 # ---------------------------------------------------------------- 运营商 & git
 
-def detect_carrier():
-    """检测本机出口运营商。返回 (CT/CU/CM/?, 出口 IP)。"""
-    try:
-        with urllib.request.urlopen(
-                "http://ip-api.com/json/?fields=isp,org,query",
-                timeout=10) as r:
-            d = json.load(r)
-            isp = (d.get("isp", "") or "") + " " + (d.get("org", "") or "")
-            ip = d.get("query")
-            if "联通" in isp or "Unicom" in isp:
-                return "CU", ip
-            if "电信" in isp or "Telecom" in isp:
-                return "CT", ip
-            if "移动" in isp or "Mobile" in isp:
-                return "CM", ip
-            return "?", ip
-    except Exception:
-        return "?", None
+CARRIER_ASN = {
+    "4134": "CT", "4812": "CT", "4809": "CT", "134774": "CT",
+    "4837": "CU", "9929": "CU", "17621": "CU", "17622": "CU", "17623": "CU", "4808": "CU",
+    "9808": "CM", "24400": "CM", "24445": "CM", "56040": "CM", "56041": "CM",
+    "56042": "CM", "56044": "CM", "56046": "CM", "56047": "CM", "56048": "CM",
+}
+
+
+def _carrier_from_text(text):
+    t = text or ""
+    for asn, isp in CARRIER_ASN.items():
+        if f"AS{asn} " in t + " " or f"AS{asn}," in t:
+            return isp
+    if "联通" in t or "Unicom" in t or "UNICOM" in t:
+        return "CU"
+    if "电信" in t or "Telecom" in t or "TELECOM" in t or "Chinanet" in t or "CHINANET" in t:
+        return "CT"
+    if "移动" in t or "Mobile" in t or "MOBILE" in t or "CMNET" in t:
+        return "CM"
+    return None
+
+
+def detect_carrier(override=None):
+    """检测本机出口运营商。返回 (CT/CU/CM/CN, 出口 IP)。
+
+    v3.3：ip-api 失败时依次换 ipinfo.io、ip.sb；都认不出时返回 "CN"（不再输出 "?"），
+    也可以用 --carrier 手动指定。
+    """
+    if override:
+        return override.upper(), None
+    sources = [
+        ("http://ip-api.com/json/?fields=isp,org,as,query",
+         lambda d: (" ".join(str(d.get(k, "") or "") for k in ("as", "isp", "org")), d.get("query"))),
+        ("https://ipinfo.io/json",
+         lambda d: (str(d.get("org", "") or ""), d.get("ip"))),
+        ("https://api.ip.sb/geoip",
+         lambda d: (f"AS{d.get('asn', '')} {d.get('isp', '')} {d.get('organization', '')}", d.get("ip"))),
+    ]
+    egress = None
+    for url, pick in sources:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.3"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                text, ip = pick(json.load(r))
+            egress = egress or ip
+            isp = _carrier_from_text(text)
+            if isp:
+                return isp, egress
+        except Exception:
+            continue
+    return "CN", egress
 
 
 def has_ipv6():
@@ -766,7 +817,7 @@ def has_ipv6():
     return False
 
 
-def git_auto_push(top_count, colo, carrier="?", extra=""):
+def git_auto_push(top_count, colo, carrier="CN", extra=""):
     """跑完自动 git add/commit/push。"""
     def run(cmd, timeout=60):
         return subprocess.run(cmd, capture_output=True, timeout=timeout)
@@ -1065,7 +1116,7 @@ def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v3.2 双栈+稳定性+GFW感知")
+    ap = argparse.ArgumentParser(description="cf-pick v3.3 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
@@ -1086,7 +1137,7 @@ def main():
                     choices=["general", "ai", "web", "video"],
                     help="场景：ai=延迟+零丢包优先，video=带宽优先")
     ap.add_argument("--sni", default=None,
-                    help="测试用 SNI（默认 speed.cloudflare.com），填节点真实 SNI 更准")
+                    help="SNI 健康检查用的域名，逗号分隔多个（填你节点的真实域名）。测速始终用 speed.cloudflare.com")
     # --xray-verify 已在 v2.8 移除（需真实 UUID，SNI 健康检查已覆盖 80% 价值）
     ap.add_argument("--evening", action="store_true",
                     help="晚高峰复测模式：只对历史 top 做轻量复测")
@@ -1094,6 +1145,8 @@ def main():
                     help="开启 Geo 归属地检查（默认跳过，CF 官方段恒为非 CN）")
     ap.add_argument("--port", type=int, default=443,
                     help="写入订阅的端口（默认 443）")
+    ap.add_argument("--carrier", choices=["CT", "CU", "CM", "ct", "cu", "cm"], default=None,
+                    help="手动指定运营商（自动检测失败时用）")
     ap.add_argument("--push", action="store_true")
     args = ap.parse_args()
 
@@ -1113,8 +1166,9 @@ def main():
     if args.v4_only:
         families = [4]
 
-    carrier, egress = detect_carrier()
-    print(f"ℹ️ 出口：{carrier} ({egress})")
+    carrier, egress = detect_carrier(args.carrier)
+    network_type = detect_network_type()
+    print(f"ℹ️ 出口：{carrier} ({egress})，网络：{network_type}")
     if 6 in families and not args.v6_only:
         # 多端点检测本机 v6 连通性（单端点 3 秒判死刑太草率）
         v6_local = has_ipv6()
@@ -1396,16 +1450,24 @@ def main():
     with open("best-ips.txt", "w") as f:
         for x in final:
             f.write(format_sub_line(x, carrier, args.port) + "\n")
+    # v3.3：结构化回传，每个 IP 带运营商、网络类型、测量时间，订阅器可区分手机蜂窝与家宽数据
+    measured_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for x in final:
+        x.setdefault("carrier", carrier)
+        x.setdefault("network_type", network_type)
+        x.setdefault("measured_at", measured_at)
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "3.2",
+                   "network_type": network_type,
+                   "egress_hash": (hashlib.sha256(egress.encode()).hexdigest()[:12] if egress else None),
+                   "version": "3.3",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                   "ips": final}, f, indent=2)
+                   "ips": final}, f, indent=2, ensure_ascii=False)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
         top_colo = final[0].get("colo", "?") if final else "?"
-        git_auto_push(len(final), top_colo, carrier, extra="v3.2")
+        git_auto_push(len(final), top_colo, carrier, extra="v3.3")
 
 
 if __name__ == "__main__":
