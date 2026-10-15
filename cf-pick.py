@@ -496,6 +496,25 @@ def detect_carrier():
         return "?", None
 
 
+def has_ipv6():
+    """多端点检测 IPv6 连通性。任一成功即判定可用。"""
+    test_ips = [
+        "2606:4700:4700::1111",  # Cloudflare DNS
+        "2001:4860:4860::8888",  # Google DNS
+        "2606:4700:4700::1001",  # Cloudflare DNS 备用
+    ]
+    for tip in test_ips:
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((tip, 443))
+            s.close()
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def git_auto_push(top_count, colo, carrier="?", extra=""):
     """跑完自动 git add/commit/push。"""
     def run(cmd, timeout=60):
@@ -647,21 +666,14 @@ def main():
 
     carrier, egress = detect_carrier()
     print(f"ℹ️ 出口：{carrier} ({egress})")
-    v6_local = False
-    if 6 in families:
-        # 快速检测本机是否有 v6
-        try:
-            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.settimeout(3)
-            s.connect(("2606:4700:4700::1111", 443))
-            s.close()
-            v6_local = True
-        except Exception:
-            v6_local = False
+    if 6 in families and not args.v6_only:
+        # 多端点检测本机 v6 连通性（单端点 3 秒判死刑太草率）
+        v6_local = has_ipv6()
         if not v6_local:
-            print("⚠️ 本机无 IPv6 连通性，跳过 v6")
-            families = [f for f in families if f != 4 or True]
+            print("⚠️ 未检测到 IPv6 连通性，跳过 v6（如确认有 v6 请用 --v6-only 强制）")
             families = [4] if 4 in families else []
+    elif args.v6_only:
+        print("ℹ️ --v6-only：跳过连通性检测，直接测 v6")
 
     if not families:
         print("❌ 没有可用的协议栈")
