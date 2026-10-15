@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.0\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.1\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -273,72 +273,61 @@ def check_geo(ip, timeout=10):
     return False, "?", False
 
 
+def _geo_single(ip, timeout=8):
+    """v3.1：单个 IP 的三级降级（GET 优先，batch POST 已被墙）。"""
+    # L1: ip-api.com GET（最快）
+    try:
+        url = (f"http://ip-api.com/json/{ip}"
+               f"?fields=status,country,countryCode,proxy")
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            d = json.load(r)
+        if d.get("status") == "success":
+            cc = d.get("countryCode", "?")
+            return (cc == "CN"), d.get("country", "?"), bool(d.get("proxy", False))
+    except Exception:
+        pass
+    # L2: ipwho.is
+    try:
+        with urllib.request.urlopen(f"http://ipwho.is/{ip}", timeout=timeout) as r:
+            d = json.load(r)
+        if d.get("success"):
+            cc = d.get("country_code", "?")
+            return (cc == "CN"), d.get("country", "?"), False
+    except Exception:
+        pass
+    # L3: db-ip.com
+    try:
+        with urllib.request.urlopen(f"https://api.db-ip.com/v2/free/{ip}",
+                                    timeout=timeout) as r:
+            d = json.load(r)
+        cc = d.get("countryCode", "?")
+        return (cc == "CN"), d.get("countryName", "?"), False
+    except Exception:
+        pass
+    return (False, "?", False)
+
+
 def check_geo_batch(ips, timeout=15):
-    """v2.6：ip-api.com /batch 接口，一次 POST 查 100 个 IP。
-    v2.9：三级降级 ip-api → ipwho.is → db-ip.com。
+    """v3.1：并发 Geo 查询（5 并发，GET 优先）。
+    v2.9 的 batch POST 已被墙，改回 GET + 并发。
 
     返回 {ip: (is_cn, country, is_proxy)}。
     """
     if not ips:
         return {}
     out = {}
-    # 第一级：ip-api.com batch
-    remaining = list(ips)
-    for i in range(0, len(ips), 100):
-        batch = ips[i:i+100]
-        try:
-            payload = json.dumps([
-                {"query": ip,
-                 "fields": "status,country,countryCode,proxy"}
-                for ip in batch
-            ]).encode()
-            req = urllib.request.Request(
-                "http://ip-api.com/batch",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                arr = json.load(r)
-            for q, d in zip(batch, arr):
-                if isinstance(d, dict) and d.get("status") == "success":
-                    cc = d.get("countryCode", "?")
-                    out[q] = ((cc == "CN"), d.get("country", "?"),
-                              bool(d.get("proxy", False)))
-                    if q in remaining:
-                        remaining.remove(q)
-        except Exception:
-            pass
-    # 第二级：ipwho.is（单个查，无 proxy 字段）
-    for ip in remaining[:]:
-        try:
-            url = f"http://ipwho.is/{ip}"
-            with urllib.request.urlopen(url, timeout=10) as r:
-                d = json.load(r)
-            if d.get("success"):
-                cc = d.get("country_code", "?")
-                out[ip] = ((cc == "CN"), d.get("country", "?"), False)
-                remaining.remove(ip)
-        except Exception:
-            pass
-    # 第三级：db-ip.com（单个查）
-    for ip in remaining[:]:
-        try:
-            url = f"https://api.db-ip.com/v2/free/{ip}"
-            with urllib.request.urlopen(url, timeout=10) as r:
-                d = json.load(r)
-            cc = d.get("countryCode", "?")
-            out[ip] = ((cc == "CN"), d.get("countryName", "?"), False)
-            remaining.remove(ip)
-        except Exception:
-            pass
-    # 全部失败的不阻塞
-    for ip in remaining:
-        out.setdefault(ip, (False, "?", False))
-    if remaining:
-        print(f"  ⚠️ {len(remaining)} 个 IP Geo 查询全失败，不阻塞")
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(_geo_single, ip): ip for ip in ips}
+        for fu in as_completed(futs):
+            ip = futs[fu]
+            try:
+                out[ip] = fu.result()
+            except Exception:
+                out[ip] = (False, "?", False)
+    failed = sum(1 for v in out.values() if v[1] == "?")
+    if failed:
+        print(f"  ⚠️ {failed} 个 IP Geo 全失败，不阻塞")
     return out
-
-
 def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
                early_exit_mbps=2.0):
     """测下载速度（MB/s）。v2.6：1s 热身 + <2MB/s 早退。失败返回 0。"""
@@ -353,7 +342,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.0\r\n\r\n")
+               f"User-Agent: cf-pick/3.1\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -423,7 +412,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.0\r\n\r\n")
+               f"User-Agent: cf-pick/3.1\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -692,7 +681,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.0\r\n\r\n")
+               f"User-Agent: cf-pick/3.1\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -1318,7 +1307,7 @@ def main():
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "3.0",
+                   "version": "3.1",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
