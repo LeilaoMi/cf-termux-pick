@@ -58,6 +58,13 @@ CONC_L2 = 10  # TLS trace：耗 CPU
 CONC_L3 = 5   # Geo API：ip-api 限流 45/分钟
 CONC_L4 = 2   # 测速：最耗流量
 
+# v3.2 测速参数（单位都是 MB/s）
+SPEED_BYTES = 10_000_000      # >10MB 不带 Referer 会被 403，批量还易 429
+SPEED_MIN_MBS = 0.3           # 绝对下限
+SPEED_CANDIDATES = 30         # L4 测速候选数（按丢包/延迟排序后取）
+MIN_OUTPUT = 10               # 输出不足时用上次仍可达的 IP 补齐
+SPEED_STATUS = {}             # ip -> HTTP 状态码（诊断用）
+
 # 测速目标
 SPEED_URL_PATH = "/__down"
 SPEED_SNI = "speed.cloudflare.com"
@@ -231,7 +238,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.1\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.2\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -329,7 +336,7 @@ def check_geo_batch(ips, timeout=15):
         print(f"  ⚠️ {failed} 个 IP Geo 全失败，不阻塞")
     return out
 def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
-               early_exit_mbps=2.0):
+               early_exit_mbs=2.0):
     """测下载速度（MB/s）。v2.6：1s 热身 + <2MB/s 早退。失败返回 0。"""
     fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
     try:
@@ -340,9 +347,10 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
-        req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
+        req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.1\r\n\r\n")
+               f"Referer: https://{sni}/\r\n"
+               f"User-Agent: cf-pick/3.2\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -351,6 +359,15 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
             if not chunk:
                 break
             head += chunk
+        # v3.2：解析状态码，非 200 直接判 0 并记录原因
+        try:
+            status = int(head.split(b"\r\n", 1)[0].split()[1])
+        except Exception:
+            status = 0
+        SPEED_STATUS[ip] = status
+        if status != 200:
+            ss.close()
+            return 0.0
         body_start = head.split(b"\r\n\r\n", 1)
         received = len(body_start[1]) if len(body_start) > 1 else 0
         t0 = time.monotonic()
@@ -369,7 +386,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
             elif warmed and time.monotonic() - w0 >= 2.0:
                 w_dt = time.monotonic() - w0
                 w_mbps = ((received - w_recv) / 1024 / 1024) / w_dt if w_dt > 0 else 0
-                if w_mbps < early_exit_mbps:
+                if w_mbps < early_exit_mbs:
                     break
                 w0, w_recv = time.monotonic(), received
         dt = time.monotonic() - t0
@@ -412,7 +429,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.1\r\n\r\n")
+               f"User-Agent: cf-pick/3.2\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -681,7 +698,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.1\r\n\r\n")
+               f"User-Agent: cf-pick/3.2\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -888,7 +905,7 @@ def _l3_geo(args):
     return (ip, lat, loss, jitter, colo, country, is_proxy)
 
 
-def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
+def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False):
     """Phase 1：并发快漏斗（v2.4 智能采样）。返回候选列表。"""
     fam_name = f"IPv{'6' if family == 6 else '4'}"
     print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 并发漏斗\n{'='*50}")
@@ -921,24 +938,31 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
     if not colo_ok:
         return []
 
-    # L3: 并发 Geo（v2.3 修复：只看 IP 归属地）
+    # L3: Geo。v3.2：CF 官方段在 Geo 库里恒为 US/CA，默认跳过；--geo 开启
     geo_ok = []
-    with ThreadPoolExecutor(max_workers=CONC_L3) as ex:
-        futs = {ex.submit(_l3_geo, t): t[0] for t in colo_ok}
-        for fu in as_completed(futs):
-            r = fu.result()
-            if r:
-                geo_ok.append(r)
-    print(f"L3 Geo非CN（{CONC_L3}并发）：{len(geo_ok)}")
+    if use_geo:
+        with ThreadPoolExecutor(max_workers=CONC_L3) as ex:
+            futs = {ex.submit(_l3_geo, t): t[0] for t in colo_ok}
+            for fu in as_completed(futs):
+                r = fu.result()
+                if r:
+                    geo_ok.append(r)
+        print(f"L3 Geo非CN（{CONC_L3}并发）：{len(geo_ok)}")
+    else:
+        geo_ok = [(ip, lat, loss, jit, colo, "?", False)
+                  for ip, lat, loss, jit, colo, _loc in colo_ok]
+        print(f"L3 Geo：跳过（CF 官方段，--geo 可开启）")
     if not geo_ok:
         return []
+    # v3.2：按（丢包, 延迟, 抖动）排序再取测速候选，不再按完成顺序随机取
+    geo_ok.sort(key=lambda x: (x[2], x[1], x[3]))
 
     # L4: 测速（2 并发，省流量）
     scored = []
     def _speed_task(t):
         ip, lat, loss, jit, colo, country, is_proxy = t
         mbps = speed_test(ip, sni)
-        if mbps > 1.0:
+        if mbps > 0:
             return {"ip": ip, "family": family,
                     "latency_ms": round(lat * 1000, 1),
                     "loss_pct": round(loss * 100, 1),
@@ -948,14 +972,29 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
         return None
 
     with ThreadPoolExecutor(max_workers=CONC_L4) as ex:
-        futs = {ex.submit(_speed_task, t): t[0] for t in geo_ok[:20]}
+        futs = {ex.submit(_speed_task, t): t[0] for t in geo_ok[:SPEED_CANDIDATES]}
         for fu in as_completed(futs):
             r = fu.result()
             if r:
                 scored.append(r)
+    # v3.2：状态码诊断
+    from collections import Counter
+    bad = Counter(v for k, v in SPEED_STATUS.items() if v != 200)
+    if bad:
+        print(f"  ⚠️ 测速非 200：{dict(bad)}（429=限流，403=被拒，0=连接失败）")
     scored.sort(key=lambda x: -x["mbps"])
-    top = scored[:top_n]
-    print(f"L4 测速（{CONC_L4}并发）：{len(scored)}，取 Top {len(top)}")
+    passed = [x for x in scored if x["mbps"] >= SPEED_MIN_MBS]
+    if passed:
+        top = passed[:top_n]
+    else:
+        # 一个都没过线：矮子里拔将军，标记低速，不让漏斗空掉
+        top = scored[:top_n]
+        for x in top:
+            x["low_speed"] = True
+        if top:
+            print(f"  ⚠️ 无 IP 达到 {SPEED_MIN_MBS} MB/s，按速度兜底输出并标记低速")
+    print(f"L4 测速（{CONC_L4}并发，测 {min(len(geo_ok), SPEED_CANDIDATES)} 个）："
+          f"{len(passed)} 个达标，取 Top {len(top)}")
     for t in top:
         print(f"  {t['ip']} [{t['colo']}] {t['latency_ms']}ms "
               f"丢包{t['loss_pct']}% {t['mbps']}MB/s")
@@ -981,8 +1020,52 @@ def sni_health_check(ip, sni_list, timeout=8):
     return out
 
 
+def format_sub_line(x, carrier, port=443):
+    """IP:端口#备注。备注示例：CU-SJC-170ms-3.1MB（低速加 -low，复用加 -old）。"""
+    ip = x["ip"]
+    host = f"[{ip}]" if ":" in ip else ip
+    remark = f"{carrier}-{x.get('colo', '?')}-{x.get('latency_ms', 0):.0f}ms"
+    if x.get("mbps"):
+        remark += f"-{x['mbps']:.1f}MB"
+    if x.get("low_speed"):
+        remark += "-low"
+    if x.get("reused"):
+        remark += "-old"
+    return f"{host}:{port}#{remark}"
+
+
+def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
+    """新结果不足 min_count 时，复测上次的 IP，仍可达的追加到末尾。"""
+    if len(final) >= min_count:
+        return final
+    try:
+        with open(path) as f:
+            old = json.load(f).get("ips", [])
+    except Exception:
+        return final
+    have = {x["ip"] for x in final}
+    added = 0
+    for x in old:
+        if len(final) >= min_count:
+            break
+        if x.get("ip") in have:
+            continue
+        lat = tcp_ping(x["ip"], timeout=2)
+        if lat is None:
+            continue
+        x = dict(x)
+        x["latency_ms"] = round(lat * 1000, 1)
+        x["reused"] = True
+        final.append(x)
+        have.add(x["ip"])
+        added += 1
+    if added:
+        print(f"  ♻️ 用上次结果补齐 {added} 个仍可达的 IP")
+    return final
+
+
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
+    ap = argparse.ArgumentParser(description="cf-pick v3.2 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
@@ -1007,6 +1090,10 @@ def main():
     # --xray-verify 已在 v2.8 移除（需真实 UUID，SNI 健康检查已覆盖 80% 价值）
     ap.add_argument("--evening", action="store_true",
                     help="晚高峰复测模式：只对历史 top 做轻量复测")
+    ap.add_argument("--geo", action="store_true",
+                    help="开启 Geo 归属地检查（默认跳过，CF 官方段恒为非 CN）")
+    ap.add_argument("--port", type=int, default=443,
+                    help="写入订阅的端口（默认 443）")
     ap.add_argument("--push", action="store_true")
     args = ap.parse_args()
 
@@ -1047,7 +1134,8 @@ def main():
     # Phase 1
     all_candidates = []
     for fam in families:
-        cands = phase1_funnel(fam, args.count, args.top, conn=_conn_early)
+        cands = phase1_funnel(fam, args.count, args.top, conn=_conn_early,
+                              use_geo=args.geo)
         all_candidates.extend(cands)
 
     _conn_early.close()
@@ -1301,19 +1389,23 @@ def main():
                 bad = [s for s, ok in health.items() if not ok]
                 print(f"    失败 SNI：{', '.join(bad[:3])}")
 
-    # 写文件（v4/v6 标注 + 真实 colo）
+    # v3.2：输出不足时，用上次结果里仍可达的 IP 补齐（订阅不突然变空/大换血）
+    final = merge_previous(final, MIN_OUTPUT)
+
+    # 写文件：订阅生成器标准格式 IP:端口#备注，IPv6 加方括号
     with open("best-ips.txt", "w") as f:
         for x in final:
-            f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
+            f.write(format_sub_line(x, carrier, args.port) + "\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "3.1",
+                   "version": "3.2",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v3.0")
+        top_colo = final[0].get("colo", "?") if final else "?"
+        git_auto_push(len(final), top_colo, carrier, extra="v3.2")
 
 
 if __name__ == "__main__":
