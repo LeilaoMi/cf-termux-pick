@@ -63,10 +63,12 @@ SPEED_URL_PATH = "/__down"
 SPEED_SNI = "speed.cloudflare.com"
 
 # AI 目标感知测试（只做 TLS 握手，不调 API、不耗 key）
+# v2.5：只测 CF 托管的 AI 域名（深挖结论：anthropic/google 不在 CF 上，测了必挂）
 AI_TARGETS = [
-    "api.openai.com",
-    "api.anthropic.com",
-    "generativelanguage.googleapis.com",
+    "api.openai.com",     # CF
+    "api.groq.com",       # CF
+    "api.mistral.ai",     # CF
+    "openrouter.ai",      # CF
 ]
 
 DB_PATH = "ip_history.db"
@@ -229,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.4\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.5\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -260,15 +262,21 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
 
 
 def check_geo(ip, timeout=10):
-    """归属地检查。返回 (is_cn, country)。失败返回 (False, '?')。"""
+    """归属地 + 代理标记检查（v2.5：ipapi.is 已死，用 ip-api proxy 字段替代）。
+
+    返回 (is_cn, country, is_proxy)。失败返回 (False, '?', False)。
+    """
     try:
-        url = f"http://ip-api.com/json/{ip}?fields=country,countryCode"
+        url = (f"http://ip-api.com/json/{ip}"
+               f"?fields=status,country,countryCode,proxy,hosting")
         with urllib.request.urlopen(url, timeout=timeout) as r:
             d = json.load(r)
-            cc = d.get("countryCode", "?")
-            return (cc == "CN"), d.get("country", "?")
+        if d.get("status") != "success":
+            return False, "?", False
+        cc = d.get("countryCode", "?")
+        return (cc == "CN"), d.get("country", "?"), bool(d.get("proxy", False))
     except Exception:
-        return False, "?"
+        return False, "?", False
 
 
 def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
@@ -284,7 +292,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.4\r\n\r\n")
+               f"User-Agent: cf-pick/2.5\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -341,7 +349,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.4\r\n\r\n")
+               f"User-Agent: cf-pick/2.5\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -493,7 +501,8 @@ def ai_target_test(ip, timeout=8):
 
 
 def abuse_check(ip, timeout=10):
-    """纯净度第三层：滥用标记检查（cfnb 方法论，best-effort）。
+    """[v2.5 已废弃] ipapi.is 滥用字段 2026-09 起需 API key，免费版已死。
+    改用 check_geo 返回的 proxy 字段。保留签名防旧代码引用报错。
 
     返回 (is_clean, detail)：
       is_clean=True → 无滥用标记
@@ -561,7 +570,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.4\r\n\r\n")
+               f"User-Agent: cf-pick/2.5\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -755,15 +764,17 @@ def _l2_trace(args):
 
 
 def _l3_geo(args):
-    """L3 单 IP：Geo 检查，返回 (ip, lat, loss, jitter, colo, country) 或 None。
+    """L3 单 IP：Geo + proxy 检查。
 
-    v2.3 修复：只用 ip-api 判 IP 归属地，不再用 trace loc（那是客户端位置）。
+    返回 (ip, lat, loss, jitter, colo, country, is_proxy) 或 None。
+    v2.3 修复：只用 ip-api 判 IP 归属地，不再用 trace loc。
+    v2.5：proxy=true 不淘汰，只标记（软降权在评分时做）。
     """
     ip, lat, loss, jitter, colo, _loc = args
-    is_cn, country = check_geo(ip)
+    is_cn, country, is_proxy = check_geo(ip)
     if is_cn:
         return None
-    return (ip, lat, loss, jitter, colo, country)
+    return (ip, lat, loss, jitter, colo, country, is_proxy)
 
 
 def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
@@ -814,7 +825,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
     # L4: 测速（2 并发，省流量）
     scored = []
     def _speed_task(t):
-        ip, lat, loss, jit, colo, country = t
+        ip, lat, loss, jit, colo, country, is_proxy = t
         mbps = speed_test(ip, sni)
         if mbps > 1.0:
             return {"ip": ip, "family": family,
@@ -822,7 +833,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
                     "loss_pct": round(loss * 100, 1),
                     "jitter_ms": round(jit * 1000, 1),
                     "mbps": round(mbps, 2), "country": country,
-                    "colo": colo}
+                    "colo": colo, "is_proxy": is_proxy}
         return None
 
     with ThreadPoolExecutor(max_workers=CONC_L4) as ex:
@@ -917,18 +928,17 @@ def main():
         mark = "✅" if ok_n == len(r) else f"⚠️{ok_n}/{len(r)}"
         print(f"  {cand['ip']} [{cand['colo']}] {mark}")
 
-    # 纯净度第三层：滥用标记（best-effort，失败不阻塞）
-    print(f"\n{'='*50}\n纯净度第三层：滥用标记\n{'='*50}")
+    # 纯净度第三层：proxy 标记（v2.5：ipapi.is 已死，用 ip-api proxy 字段）
+    # proxy=true → 软降权 ×0.9，不淘汰（有误报可能）
+    print(f"\n{'='*50}\n纯净度第三层：proxy 标记\n{'='*50}")
     for cand in all_candidates:
-        clean, detail = abuse_check(cand["ip"])
-        cand["abuse_clean"] = clean
-        cand["abuse_detail"] = detail
-        if clean is True:
-            print(f"  {cand['ip']} ✅ 纯净")
-        elif clean is False:
-            print(f"  {cand['ip']} ❌ {detail} → 降权")
+        if cand.get("is_proxy"):
+            cand["abuse_clean"] = False
+            cand["abuse_detail"] = "proxy=true"
+            print(f"  {cand['ip']} ⚠️ proxy 标记 → 降权10%")
         else:
-            print(f"  {cand['ip']} ❓ 检查失败，不阻塞")
+            cand["abuse_clean"] = True
+            cand["abuse_detail"] = "clean"
 
     conn = init_db()
 
@@ -982,14 +992,14 @@ def main():
             # GFW 敏感降权（但不直接扔，冷却后可能恢复）
             if c["gfw_sensitive"]:
                 s *= 0.85
-            # 纯净度第三层：滥用标记降权
-            if c.get("abuse_clean") is False:
-                s *= 0.7
-                print(f"    {c['ip']} 滥用标记，降权30%")
-            # 纯净度第二层：AI 握手不全过降权
-            ai_ok = c.get("ai_ok", 3)
-            if ai_ok < 3:
-                s *= (0.7 + 0.1 * ai_ok)  # 2/3→0.9, 1/3→0.8, 0/3→0.7
+            # 纯净度第三层：proxy 标记软降权（v2.5：×0.9，不淘汰）
+            if c.get("is_proxy"):
+                s *= 0.9
+                print(f"    {c['ip']} proxy 标记，降权10%")
+            # 纯净度第二层：AI 握手不全过降权（v2.5：4 个 CF 托管目标）
+            ai_ok = c.get("ai_ok", 4)
+            if ai_ok < 4:
+                s *= (0.6 + 0.1 * ai_ok)  # 3/4→0.9, 2/4→0.8, 1/4→0.7, 0/4→0.6
             c["final_score"] = round(max(0, s), 1)
             # 入库
             record_history(conn, ip, c["family"], args.colo, carrier,
@@ -1041,19 +1051,51 @@ def main():
             else:
                 print("  → 两者接近")
 
-    # 写文件（v4/v6 标注）
+    # v2.5 /24 分散过滤：每 /24 最多 5 个，至少 4 个 /24
+    # （深挖结论：GFW 惩罚精确到单 IP，但情报是关联的）
+    def diversify(cands, per_24=5, min_nets=4):
+        from collections import defaultdict
+        by_24 = defaultdict(list)
+        for x in cands:
+            try:
+                net = str(ipaddress.ip_network(x["ip"] + "/24", strict=False))
+            except Exception:
+                net = "unknown"
+            by_24[net].append(x)
+        # 按每网段最佳分排序网段
+        nets_sorted = sorted(by_24.keys(),
+                             key=lambda n: -max(y.get("final_score", 0)
+                                                for y in by_24[n]))
+        out = []
+        for net in nets_sorted:
+            # 每段内按分排序，取前 per_24
+            seg = sorted(by_24[net],
+                         key=lambda y: -y.get("final_score", 0))[:per_24]
+            out.extend(seg)
+        # 如果网段数不足，说明候选太集中，保留原样并警告
+        if len(by_24) < min_nets:
+            print(f"  ⚠️ 仅 {len(by_24)} 个 /24，集中度偏高")
+        else:
+            print(f"  ✅ 分散到 {len(by_24)} 个 /24，每段 ≤{per_24} 个")
+        # 保持全局按分排序
+        out.sort(key=lambda x: -x.get("final_score", 0))
+        return out
+
+    final = diversify(final)
+
+    # 写文件（v4/v6 标注 + 真实 colo）
     with open("best-ips.txt", "w") as f:
-        for c in final:
-            f.write(f"{c['ip']}#v{c['family']}-{args.colo}\n")
+        for x in final:
+            f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
-        json.dump({"colo": args.colo, "carrier": carrier,
-                   "version": "2.4",
+        json.dump({"carrier": carrier,
+                   "version": "2.5",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.0")
+        git_auto_push(len(final), args.colo, carrier, extra="v2.5")
 
 
 if __name__ == "__main__":
