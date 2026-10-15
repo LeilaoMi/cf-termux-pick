@@ -88,7 +88,8 @@ AI 场景下，5Mbps 零丢包 > 100Mbps 偶发丢包。
 | `--geo` | - | 开启 Geo 归属地检查（默认跳过） |
 | `--port` | 443 | 写入订阅的端口 |
 | `--carrier` | 自动 | 手动指定运营商 CT/CU/CM（自动检测失败时用） |
-| `--push` | - | 自动 commit+push，带远端 SHA 验证 |
+| `--push` | - | 自动 commit+push，带远端 SHA 验证；出口不在国内（开着 VPN）时自动跳过 |
+| `--force-push` | - | 开着 VPN 也强制 push（一般不要用） |
 
 ## 输出
 
@@ -131,6 +132,7 @@ chmod +x ~/.shortcuts/cf-pick
 
 ## 版本历史
 
+- **v3.4**：自动识别出口国家，开着 VPN（出口不在国内）时不 push，避免把代理线路当成国内实测回传订阅器（`--force-push` 可强推）；`best-ips.json` 增加 `egress_country`/`egress_cn`，订阅器据此把手机实测并入三网排序；备注里机房未知时写 `UNK` 而不是 `?`；清理旧版本注释
 - **v3.3**：IPv4 随机采样改为在全部 /24 里不放回均匀抽（每个 /24 最多 1 个）；运营商检测换三个来源按 ASN 识别，认不出时标 `CN` 不再输出 `?`，可用 `--carrier` 指定；`best-ips.json` 每个 IP 带运营商、网络类型（wifi/cellular）、测量时间；`--sni` 说明改正（只用于 SNI 健康检查，测速始终走 speed.cloudflare.com）；版本号统一
 - **v3.2**：测速修复（10MB + Referer + 状态码诊断）、L4 按丢包/延迟排序取 30、动态门槛 0.3 MB/s + 兜底、Geo 默认跳过、输出订阅标准格式、不足 10 个用上次结果补齐
 - **v3.0**：历史库 schema 升级（时段/网络/分项）
