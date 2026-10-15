@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.9\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.0\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -353,7 +353,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.9\r\n\r\n")
+               f"User-Agent: cf-pick/3.0\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -423,7 +423,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.9\r\n\r\n")
+               f"User-Agent: cf-pick/3.0\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -520,6 +520,31 @@ def stability_score(rounds_results):
 
 # ---------------------------------------------------------------- Phase 4: 历史库
 
+def detect_network_type():
+    """v3.0：检测网络类型（WiFi/蜂窝/未知）。"""
+    import subprocess
+    try:
+        # 方法1：ip route 看网卡名
+        r = subprocess.run(["ip", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=3)
+        out = r.stdout.lower()
+        if "wlan" in out:
+            return "wifi"
+        if "rmnet" in out or "ccmni" in out or "pdp" in out:
+            return "cellular"
+    except Exception:
+        pass
+    try:
+        # 方法2：Termux:API
+        r = subprocess.run(["termux-wifi-connectioninfo"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and "ssid" in r.stdout.lower():
+            return "wifi"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def init_db(path=DB_PATH):
     conn = sqlite3.connect(path)
     conn.execute("""CREATE TABLE IF NOT EXISTS history (
@@ -527,18 +552,41 @@ def init_db(path=DB_PATH):
         latency_ms REAL, mbps REAL, ok INTEGER, fail_type TEXT,
         stability REAL
     )""")
+    # v3.0 迁移：加新列（老数据不受影响）
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
+    migrations = [
+        ("hour", "INTEGER"),
+        ("network_type", "TEXT"),
+        ("loss_pct", "REAL"),
+        ("jitter_ms", "REAL"),
+        ("ai_ok", "INTEGER"),
+        ("is_proxy", "INTEGER"),
+    ]
+    for col, typ in migrations:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE history ADD COLUMN {col} {typ}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ip ON history(ip)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON history(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_hour ON history(hour)")
     conn.commit()
     return conn
 
 
 def record_history(conn, ip, family, colo, carrier, latency_ms, mbps,
-                   ok, fail_type, stability):
+                   ok, fail_type, stability, loss_pct=None, jitter_ms=None,
+                   ai_ok=None, is_proxy=None):
+    """v3.0：记录时段、网络类型、分项指标。"""
+    import datetime
+    hour = datetime.datetime.now().hour
+    net = detect_network_type()
     conn.execute(
-        "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?)",
+        """INSERT INTO history
+           (ip, ts, family, colo, carrier, latency_ms, mbps, ok, fail_type,
+            stability, hour, network_type, loss_pct, jitter_ms, ai_ok, is_proxy)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ip, time.time(), family, colo, carrier, latency_ms, mbps,
-         1 if ok else 0, fail_type, stability))
+         1 if ok else 0, fail_type, stability, hour, net,
+         loss_pct, jitter_ms, ai_ok, 1 if is_proxy else 0))
     conn.commit()
 
 
@@ -644,7 +692,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.9\r\n\r\n")
+               f"User-Agent: cf-pick/3.0\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -1103,9 +1151,11 @@ def main():
                 s *= (0.6 + 0.1 * ai_ok)  # 3/4→0.9, 2/4→0.8, 1/4→0.7, 0/4→0.6
             c["final_score"] = round(max(0, s), 1)
             # 入库
-            record_history(conn, ip, c["family"], args.colo, carrier,
-                           c["latency_ms"], c["mbps"],
-                           score > 50, "mixed", score)
+            record_history(conn, ip, c["family"], c.get("colo", args.colo),
+                           carrier, c["latency_ms"], c["mbps"],
+                           score > 50, "mixed", score,
+                           loss_pct=c.get("loss_pct"), jitter_ms=c.get("jitter_ms"),
+                           ai_ok=c.get("ai_ok"), is_proxy=c.get("is_proxy"))
             final.append(c)
         final.sort(key=lambda x: -x["final_score"])
     else:
@@ -1134,8 +1184,11 @@ def main():
             if c.get("is_proxy"):
                 s *= 0.9
             c["final_score"] = round(max(0, s), 1)
-            record_history(conn, c["ip"], c["family"], args.colo, carrier,
-                           c["latency_ms"], c["mbps"], True, "ok", None)
+            record_history(conn, c["ip"], c["family"],
+                           c.get("colo", args.colo), carrier,
+                           c["latency_ms"], c["mbps"], True, "ok", None,
+                           loss_pct=c.get("loss_pct"), jitter_ms=c.get("jitter_ms"),
+                           ai_ok=c.get("ai_ok"), is_proxy=c.get("is_proxy"))
             final.append(c)
         final.sort(key=lambda x: -x["final_score"])
 
@@ -1265,13 +1318,13 @@ def main():
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "2.9",
+                   "version": "3.0",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.9")
+        git_auto_push(len(final), args.colo, carrier, extra="v3.0")
 
 
 if __name__ == "__main__":
