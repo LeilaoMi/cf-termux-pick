@@ -231,7 +231,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.5\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.6\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -265,22 +265,57 @@ def check_geo(ip, timeout=10):
     """归属地 + 代理标记检查（v2.5：ipapi.is 已死，用 ip-api proxy 字段替代）。
 
     返回 (is_cn, country, is_proxy)。失败返回 (False, '?', False)。
+    v2.6：保留单查接口，批量走 check_geo_batch。
     """
-    try:
-        url = (f"http://ip-api.com/json/{ip}"
-               f"?fields=status,country,countryCode,proxy,hosting")
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            d = json.load(r)
-        if d.get("status") != "success":
-            return False, "?", False
-        cc = d.get("countryCode", "?")
-        return (cc == "CN"), d.get("country", "?"), bool(d.get("proxy", False))
-    except Exception:
-        return False, "?", False
+    r = check_geo_batch([ip], timeout=timeout)
+    if r and ip in r:
+        return r[ip]
+    return False, "?", False
 
 
-def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
-    """测下载速度（MB/s）。失败返回 0。"""
+def check_geo_batch(ips, timeout=15):
+    """v2.6：ip-api.com /batch 接口，一次 POST 查 100 个 IP。
+
+    返回 {ip: (is_cn, country, is_proxy)}。
+    免费版 15 batches/分钟，读 X-Rl 头做限流。
+    """
+    if not ips:
+        return {}
+    out = {}
+    # 每批最多 100
+    for i in range(0, len(ips), 100):
+        batch = ips[i:i+100]
+        try:
+            payload = json.dumps([
+                {"query": ip,
+                 "fields": "status,country,countryCode,proxy"}
+                for ip in batch
+            ]).encode()
+            req = urllib.request.Request(
+                "http://ip-api.com/batch",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                # 读限流头
+                rl = r.headers.get("X-Rl", "?")
+                arr = json.load(r)
+            for q, d in zip(batch, arr):
+                if isinstance(d, dict) and d.get("status") == "success":
+                    cc = d.get("countryCode", "?")
+                    out[q] = ((cc == "CN"), d.get("country", "?"),
+                              bool(d.get("proxy", False)))
+                else:
+                    out[q] = (False, "?", False)
+        except Exception:
+            for q in batch:
+                out.setdefault(q, (False, "?", False))
+    return out
+
+
+def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
+               early_exit_mbps=2.0):
+    """测下载速度（MB/s）。v2.6：1s 热身 + <2MB/s 早退。失败返回 0。"""
     fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
     try:
         s = socket.socket(fam, socket.SOCK_STREAM)
@@ -292,7 +327,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.5\r\n\r\n")
+               f"User-Agent: cf-pick/2.6\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -304,11 +339,24 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         body_start = head.split(b"\r\n\r\n", 1)
         received = len(body_start[1]) if len(body_start) > 1 else 0
         t0 = time.monotonic()
+        warmed = False
+        w0, w_recv = t0, received
         while time.monotonic() - t0 < seconds:
             chunk = ss.recv(65536)
             if not chunk:
                 break
             received += len(chunk)
+            el = time.monotonic() - t0
+            # v2.6 早退：1s 热身后，若 2s 窗口速度 <2MB/s，直接中断
+            if not warmed and el >= 1.0:
+                warmed = True
+                w0, w_recv = time.monotonic(), received
+            elif warmed and time.monotonic() - w0 >= 2.0:
+                w_dt = time.monotonic() - w0
+                w_mbps = ((received - w_recv) / 1024 / 1024) / w_dt if w_dt > 0 else 0
+                if w_mbps < early_exit_mbps:
+                    break
+                w0, w_recv = time.monotonic(), received
         dt = time.monotonic() - t0
         ss.close()
         if dt <= 0:
@@ -349,7 +397,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.5\r\n\r\n")
+               f"User-Agent: cf-pick/2.6\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -570,7 +618,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.5\r\n\r\n")
+               f"User-Agent: cf-pick/2.6\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -851,6 +899,77 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None):
     return top
 
 
+def xray_verify(ip, sni="speed.cloudflare.com", timeout=10):
+    """v2.6：用 Xray 真实隧道验证 IP 可用性。
+
+    只做二值判断（能/不能），不测速。
+    需要 Termux 装好 xray 二进制。
+    返回 True/False。
+    """
+    import subprocess, tempfile, os
+    # 最小 VLESS 配置（只验证连通性）
+    config = {
+        "inbounds": [{
+            "port": 10809, "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": False}
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {"vnext": [{
+                "address": ip, "port": 443,
+                "users": [{"id": "00000000-0000-0000-0000-000000000000",
+                           "encryption": "none"}]
+            }]},
+            "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {"serverName": sni, "allowInsecure": True}
+            }
+        }]
+    }
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+                                         delete=False) as f:
+            json.dump(config, f)
+            cfg_path = f.name
+        # 启动 xray
+        proc = subprocess.Popen(
+            ["xray", "run", "-c", cfg_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)  # 等待启动
+        try:
+            # 通过 SOCKS 代理请求 generate_204
+            import socket as sk
+            s = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(("127.0.0.1", 10809))
+            # SOCKS5 握手
+            s.sendall(b"\x05\x01\x00")
+            resp = s.recv(2)
+            if resp != b"\x05\x00":
+                return False
+            # 连接 generate_204
+            host = "www.google.com"
+            req = b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
+            req += b"\x00\x50"
+            s.sendall(req)
+            resp = s.recv(10)
+            if resp[1] != 0:
+                return False
+            # 发 HTTP 请求
+            s.sendall(b"GET http://www.google.com/generate_204 HTTP/1.1\r\n"
+                      b"Host: www.google.com\r\n\r\n")
+            data = s.recv(1024)
+            s.close()
+            return b"204" in data
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            os.unlink(cfg_path)
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
@@ -869,6 +988,15 @@ def main():
                     help="对单个 IP 做触发器探测")
     ap.add_argument("--ai-test", action="store_true",
                     help="对候选做 AI 目标握手测试")
+    ap.add_argument("--scene", default="general",
+                    choices=["general", "ai", "web", "video"],
+                    help="场景：ai=延迟+零丢包优先，video=带宽优先")
+    ap.add_argument("--sni", default=None,
+                    help="测试用 SNI（默认 speed.cloudflare.com），填节点真实 SNI 更准")
+    ap.add_argument("--xray-verify", action="store_true",
+                    help="对 Top N 用 Xray 真实隧道验证（需装 xray）")
+    ap.add_argument("--evening", action="store_true",
+                    help="晚高峰复测模式：只对历史 top 做轻量复测")
     ap.add_argument("--push", action="store_true")
     args = ap.parse_args()
 
@@ -1008,11 +1136,35 @@ def main():
             final.append(c)
         final.sort(key=lambda x: -x["final_score"])
     else:
+        # v2.6：默认排名引入丢包/抖动扣分（Zeus 式），不再纯按带宽
         for c in all_candidates:
-            c["final_score"] = c["mbps"]
+            if args.scene == "ai":
+                # AI 场景：延迟+零丢包优先，带宽几乎无关
+                s = 100.0
+                s -= c.get("loss_pct", 0) * 2.0  # 丢包双倍扣
+                s -= min(50.0, c["latency_ms"] / 1000.0 * 50.0)
+                s -= min(20.0, c.get("jitter_ms", 0) / 200.0 * 20.0)
+                s += min(5.0, (c["mbps"] / 20.0) * 5.0)  # 带宽只加分
+            elif args.scene == "video":
+                # 视频场景：带宽优先
+                s = c["mbps"] * 2.0
+                s -= c.get("loss_pct", 0) * 1.0
+                s -= min(20.0, c["latency_ms"] / 1000.0 * 20.0)
+            else:
+                # 通用：Zeus 扣分制
+                s = 100.0
+                s -= c.get("loss_pct", 0) * 0.9
+                s -= min(45.0, c["latency_ms"] / 1000.0 * 45.0)
+                s -= min(20.0, c.get("jitter_ms", 0) / 200.0 * 20.0)
+                s += min(10.0, (c["mbps"] / 20.0) ** 0.65 * 10.0)
+            # proxy 软降权
+            if c.get("is_proxy"):
+                s *= 0.9
+            c["final_score"] = round(max(0, s), 1)
             record_history(conn, c["ip"], c["family"], args.colo, carrier,
                            c["latency_ms"], c["mbps"], True, "ok", None)
             final.append(c)
+        final.sort(key=lambda x: -x["final_score"])
 
     conn.close()
 
@@ -1083,19 +1235,38 @@ def main():
 
     final = diversify(final)
 
+    # v2.6：Xray 隧道验证（可选，只对 Top N 做二值可用性检查）
+    if args.xray_verify and final:
+        print(f"\n{'='*50}\nXray 隧道验证（Top {min(10, len(final))}）\n{'='*50}")
+        sni = args.sni or SPEED_SNI
+        verified = []
+        for x in final[:10]:
+            ok = xray_verify(x["ip"], sni=sni)
+            x["xray_ok"] = ok
+            mark = "✅" if ok else "❌"
+            print(f"  {x['ip']} {mark}")
+            if ok:
+                verified.append(x)
+        if verified:
+            print(f"  → {len(verified)}/{min(10, len(final))} 通过隧道验证")
+            # 隧道验证通过的排前面
+            final = verified + [x for x in final if not x.get("xray_ok")]
+        else:
+            print("  ⚠️ 全部未通过，保留原排名（可能是配置问题）")
+
     # 写文件（v4/v6 标注 + 真实 colo）
     with open("best-ips.txt", "w") as f:
         for x in final:
             f.write(f"{x['ip']}#v{x['family']}-{x.get('colo', '?')}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"carrier": carrier,
-                   "version": "2.5",
+                   "version": "2.6",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
     if args.push:
-        git_auto_push(len(final), args.colo, carrier, extra="v2.5")
+        git_auto_push(len(final), args.colo, carrier, extra="v2.6")
 
 
 if __name__ == "__main__":
