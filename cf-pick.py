@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cf-pick.py v3.3 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
+cf-pick.py v3.4 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
 
 Phase 1: 双栈采样 → 四层漏斗（TCP延迟 → colo → 送中过滤 → 测速）
 Phase 2: 稳定性 burn-in（多轮复测，识别 GFW 残余审查模式）
@@ -53,13 +53,13 @@ CF_V6 = [
 # GFW 残余审查时长：学术实测 120-180 秒，冷却取 300 秒保底
 GFW_COOLDOWN = 300
 
-# v2.3 并发配置（手机安全值）
+# 并发配置（手机安全值）
 CONC_L1 = 20  # TCP 握手：最便宜
 CONC_L2 = 10  # TLS trace：耗 CPU
 CONC_L3 = 5   # Geo API：ip-api 限流 45/分钟
 CONC_L4 = 2   # 测速：最耗流量
 
-# v3.2 测速参数（单位都是 MB/s）
+# 测速参数（单位都是 MB/s）
 SPEED_BYTES = 10_000_000      # >10MB 不带 Referer 会被 403，批量还易 429
 SPEED_MIN_MBS = 0.3           # 绝对下限
 SPEED_CANDIDATES = 30         # L4 测速候选数（按丢包/延迟排序后取）
@@ -71,7 +71,7 @@ SPEED_URL_PATH = "/__down"
 SPEED_SNI = "speed.cloudflare.com"
 
 # AI 目标感知测试（只做 TLS 握手，不调 API、不耗 key）
-# v2.5：只测 CF 托管的 AI 域名（深挖结论：anthropic/google 不在 CF 上，测了必挂）
+# 只测 CF 托管的 AI 域名（深挖结论：anthropic/google 不在 CF 上，测了必挂）
 AI_TARGETS = [
     "api.openai.com",     # CF
     "api.groq.com",       # CF
@@ -85,7 +85,7 @@ DB_PATH = "ip_history.db"
 # ---------------------------------------------------------------- 基础工具
 
 def get_good_neighborhoods(conn, family=4, min_score=60, days=7, limit=20):
-    """从历史库提取优质 /24 网段（v2.4 智能采样）。
+    """从历史库提取优质 /24 网段（智能采样）。
 
     返回 [(network_str, weight)]，按加权成功率排序。
     zqy857 邻域加权思想：出过好 IP 的 C 段优先。
@@ -125,7 +125,7 @@ def get_good_neighborhoods(conn, family=4, min_score=60, days=7, limit=20):
 
 
 def sample_ips(family, count, conn=None, exploit_ratio=0.6):
-    """整数范围随机采样（v2.4：60% 优质邻域 + 40% 随机探索）。
+    """整数范围随机采样（60% 优质邻域 + 40% 随机探索）。
 
     conn=None 时退化为纯随机（冷启动）。
     """
@@ -154,7 +154,7 @@ def sample_ips(family, count, conn=None, exploit_ratio=0.6):
             smart_count = len(out)
             print(f"  智能采样：{smart_count} 个（来自 {len(neighborhoods)} 个优质 /24）")
 
-    # 随机部分：补足剩余。v3.3：IPv4 先在所有 /24 里不放回地均匀抽，再在 /24 内随机取一个 host
+    # 随机部分：补足剩余。IPv4 先在所有 /24 里不放回地均匀抽，再在 /24 内随机取一个 host
     # （思路同 XIU2 的每 /24 取 1 个），避免 104.16/13、172.64/13 两个大段占满样本、同一 /24 重复抽。
     nets = [ipaddress.ip_network(cidr) for cidr in ranges]
     need = count - len(out)
@@ -256,7 +256,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.3\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.4\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -287,10 +287,10 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
 
 
 def check_geo(ip, timeout=10):
-    """归属地 + 代理标记检查（v2.5：ipapi.is 已死，用 ip-api proxy 字段替代）。
+    """归属地 + 代理标记检查（ipapi.is 已死，用 ip-api proxy 字段替代）。
 
     返回 (is_cn, country, is_proxy)。失败返回 (False, '?', False)。
-    v2.6：保留单查接口，批量走 check_geo_batch。
+    保留单查接口，批量走 check_geo_batch。
     """
     r = check_geo_batch([ip], timeout=timeout)
     if r and ip in r:
@@ -299,7 +299,7 @@ def check_geo(ip, timeout=10):
 
 
 def _geo_single(ip, timeout=8):
-    """v3.1：单个 IP 的三级降级（GET 优先，batch POST 已被墙）。"""
+    """单个 IP 的三级降级（GET 优先，batch POST 已被墙）。"""
     # L1: ip-api.com GET（最快）
     try:
         url = (f"http://ip-api.com/json/{ip}"
@@ -333,8 +333,8 @@ def _geo_single(ip, timeout=8):
 
 
 def check_geo_batch(ips, timeout=15):
-    """v3.1：并发 Geo 查询（5 并发，GET 优先）。
-    v2.9 的 batch POST 已被墙，改回 GET + 并发。
+    """并发 Geo 查询（5 并发，GET 优先）。
+    之前的 batch POST 已被墙，改回 GET + 并发。
 
     返回 {ip: (is_cn, country, is_proxy)}。
     """
@@ -355,7 +355,7 @@ def check_geo_batch(ips, timeout=15):
     return out
 def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
                early_exit_mbs=2.0):
-    """测下载速度（MB/s）。v2.6：1s 热身 + <2MB/s 早退。失败返回 0。"""
+    """测下载速度（MB/s）。1s 热身 + <2MB/s 早退。失败返回 0。"""
     fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
     try:
         s = socket.socket(fam, socket.SOCK_STREAM)
@@ -368,7 +368,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
                f"Referer: https://{sni}/\r\n"
-               f"User-Agent: cf-pick/3.3\r\n\r\n")
+               f"User-Agent: cf-pick/3.4\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -377,7 +377,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
             if not chunk:
                 break
             head += chunk
-        # v3.2：解析状态码，非 200 直接判 0 并记录原因
+        # 解析状态码，非 200 直接判 0 并记录原因
         try:
             status = int(head.split(b"\r\n", 1)[0].split()[1])
         except Exception:
@@ -397,7 +397,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
                 break
             received += len(chunk)
             el = time.monotonic() - t0
-            # v2.6 早退：1s 热身后，若 2s 窗口速度 <2MB/s，直接中断
+            # 早退：1s 热身后，若 2s 窗口速度 <2MB/s，直接中断
             if not warmed and el >= 1.0:
                 warmed = True
                 w0, w_recv = time.monotonic(), received
@@ -447,7 +447,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.3\r\n\r\n")
+               f"User-Agent: cf-pick/3.4\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -545,7 +545,7 @@ def stability_score(rounds_results):
 # ---------------------------------------------------------------- Phase 4: 历史库
 
 def detect_network_type():
-    """v3.0：检测网络类型（WiFi/蜂窝/未知）。"""
+    """检测网络类型（WiFi/蜂窝/未知）。"""
     import subprocess
     try:
         # 方法1：ip route 看网卡名
@@ -576,7 +576,7 @@ def init_db(path=DB_PATH):
         latency_ms REAL, mbps REAL, ok INTEGER, fail_type TEXT,
         stability REAL
     )""")
-    # v3.0 迁移：加新列（老数据不受影响）
+    # 迁移：加新列（老数据不受影响）
     cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
     migrations = [
         ("hour", "INTEGER"),
@@ -599,7 +599,7 @@ def init_db(path=DB_PATH):
 def record_history(conn, ip, family, colo, carrier, latency_ms, mbps,
                    ok, fail_type, stability, loss_pct=None, jitter_ms=None,
                    ai_ok=None, is_proxy=None):
-    """v3.0：记录时段、网络类型、分项指标。"""
+    """记录时段、网络类型、分项指标。"""
     import datetime
     hour = datetime.datetime.now().hour
     net = detect_network_type()
@@ -647,7 +647,7 @@ def ai_target_test(ip, timeout=8):
 
 
 def abuse_check(ip, timeout=10):
-    """[v2.5 已废弃] ipapi.is 滥用字段 2026-09 起需 API key，免费版已死。
+    """[已废弃] ipapi.is 滥用字段 2026-09 起需 API key，免费版已死。
     改用 check_geo 返回的 proxy 字段。保留签名防旧代码引用报错。
 
     返回 (is_clean, detail)：
@@ -716,7 +716,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.3\r\n\r\n")
+               f"User-Agent: cf-pick/3.4\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -768,34 +768,34 @@ def _carrier_from_text(text):
 
 
 def detect_carrier(override=None):
-    """检测本机出口运营商。返回 (CT/CU/CM/CN, 出口 IP)。
+    """检测本机出口运营商。返回 (CT/CU/CM/CN, 出口 IP, 出口国家代码)。
 
-    v3.3：ip-api 失败时依次换 ipinfo.io、ip.sb；都认不出时返回 "CN"（不再输出 "?"），
-    也可以用 --carrier 手动指定。
+    ip-api 失败时依次换 ipinfo.io、ip.sb；都认不出时返回 "CN"（不再输出 "?"）。
+    --carrier 只覆盖运营商，出口国家照样检测：开着 VPN 时国家不是 CN，结果不回传订阅器。
     """
-    if override:
-        return override.upper(), None
     sources = [
-        ("http://ip-api.com/json/?fields=isp,org,as,query",
-         lambda d: (" ".join(str(d.get(k, "") or "") for k in ("as", "isp", "org")), d.get("query"))),
+        ("http://ip-api.com/json/?fields=isp,org,as,query,countryCode",
+         lambda d: (" ".join(str(d.get(k, "") or "") for k in ("as", "isp", "org")), d.get("query"), d.get("countryCode"))),
         ("https://ipinfo.io/json",
-         lambda d: (str(d.get("org", "") or ""), d.get("ip"))),
+         lambda d: (str(d.get("org", "") or ""), d.get("ip"), d.get("country"))),
         ("https://api.ip.sb/geoip",
-         lambda d: (f"AS{d.get('asn', '')} {d.get('isp', '')} {d.get('organization', '')}", d.get("ip"))),
+         lambda d: (f"AS{d.get('asn', '')} {d.get('isp', '')} {d.get('organization', '')}", d.get("ip"), d.get("country_code"))),
     ]
     egress = None
+    country = None
     for url, pick in sources:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.3"})
+            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.4"})
             with urllib.request.urlopen(req, timeout=8) as r:
-                text, ip = pick(json.load(r))
+                text, ip, cc = pick(json.load(r))
             egress = egress or ip
+            country = country or (str(cc).upper() if cc else None)
             isp = _carrier_from_text(text)
             if isp:
-                return isp, egress
+                return (override.upper() if override else isp), egress, country
         except Exception:
             continue
-    return "CN", egress
+    return (override.upper() if override else "CN"), egress, country
 
 
 def has_ipv6():
@@ -913,7 +913,7 @@ def _l1_probe(ip):
     lats = []
     fails = 0
     for _ in range(3):
-        lat = tcp_ping(ip, timeout=2)  # v2.3：超时 3→2s，失败更快
+        lat = tcp_ping(ip, timeout=2)  # 超时 3→2s，失败更快
         if lat is None:
             fails += 1
         else:
@@ -946,8 +946,8 @@ def _l3_geo(args):
     """L3 单 IP：Geo + proxy 检查。
 
     返回 (ip, lat, loss, jitter, colo, country, is_proxy) 或 None。
-    v2.3 修复：只用 ip-api 判 IP 归属地，不再用 trace loc。
-    v2.5：proxy=true 不淘汰，只标记（软降权在评分时做）。
+    修复：只用 ip-api 判 IP 归属地，不再用 trace loc。
+    proxy=true 不淘汰，只标记（软降权在评分时做）。
     """
     ip, lat, loss, jitter, colo, _loc = args
     is_cn, country, is_proxy = check_geo(ip)
@@ -957,7 +957,7 @@ def _l3_geo(args):
 
 
 def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False):
-    """Phase 1：并发快漏斗（v2.4 智能采样）。返回候选列表。"""
+    """Phase 1：并发快漏斗（智能采样）。返回候选列表。"""
     fam_name = f"IPv{'6' if family == 6 else '4'}"
     print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 并发漏斗\n{'='*50}")
     ips = sample_ips(family, count, conn)
@@ -989,7 +989,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False)
     if not colo_ok:
         return []
 
-    # L3: Geo。v3.2：CF 官方段在 Geo 库里恒为 US/CA，默认跳过；--geo 开启
+    # L3: Geo。CF 官方段在 Geo 库里恒为 US/CA，默认跳过；--geo 开启
     geo_ok = []
     if use_geo:
         with ThreadPoolExecutor(max_workers=CONC_L3) as ex:
@@ -1005,7 +1005,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False)
         print(f"L3 Geo：跳过（CF 官方段，--geo 可开启）")
     if not geo_ok:
         return []
-    # v3.2：按（丢包, 延迟, 抖动）排序再取测速候选，不再按完成顺序随机取
+    # 按（丢包, 延迟, 抖动）排序再取测速候选，不再按完成顺序随机取
     geo_ok.sort(key=lambda x: (x[2], x[1], x[3]))
 
     # L4: 测速（2 并发，省流量）
@@ -1028,7 +1028,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False)
             r = fu.result()
             if r:
                 scored.append(r)
-    # v3.2：状态码诊断
+    # 状态码诊断
     from collections import Counter
     bad = Counter(v for k, v in SPEED_STATUS.items() if v != 200)
     if bad:
@@ -1053,14 +1053,14 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False)
 
 
 def parse_sni_list(sni_arg):
-    """v2.7：解析逗号分隔的 SNI 列表。空→默认。"""
+    """解析逗号分隔的 SNI 列表。空→默认。"""
     if not sni_arg:
         return [SPEED_SNI]
     return [s.strip() for s in sni_arg.split(",") if s.strip()] or [SPEED_SNI]
 
 
 def sni_health_check(ip, sni_list, timeout=8):
-    """v2.7：对 IP 测试多个 SNI 的 TLS 握手健康度。
+    """对 IP 测试多个 SNI 的 TLS 握手健康度。
 
     返回 {sni: ok}。用于发现被 GFW 针对的 SNI。
     """
@@ -1075,7 +1075,8 @@ def format_sub_line(x, carrier, port=443):
     """IP:端口#备注。备注示例：CU-SJC-170ms-3.1MB（低速加 -low，复用加 -old）。"""
     ip = x["ip"]
     host = f"[{ip}]" if ":" in ip else ip
-    remark = f"{carrier}-{x.get('colo', '?')}-{x.get('latency_ms', 0):.0f}ms"
+    colo = x.get('colo') if x.get('colo') not in (None, '', '?') else 'UNK'
+    remark = f"{carrier}-{colo}-{x.get('latency_ms', 0):.0f}ms"
     if x.get("mbps"):
         remark += f"-{x['mbps']:.1f}MB"
     if x.get("low_speed"):
@@ -1116,9 +1117,9 @@ def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v3.3 双栈+稳定性+GFW感知")
+    ap = argparse.ArgumentParser(description="cf-pick v3.4 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
-                    help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
+                    help="已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
                     help="每协议栈采样数")
     ap.add_argument("--top", type=int, default=20,
@@ -1138,7 +1139,7 @@ def main():
                     help="场景：ai=延迟+零丢包优先，video=带宽优先")
     ap.add_argument("--sni", default=None,
                     help="SNI 健康检查用的域名，逗号分隔多个（填你节点的真实域名）。测速始终用 speed.cloudflare.com")
-    # --xray-verify 已在 v2.8 移除（需真实 UUID，SNI 健康检查已覆盖 80% 价值）
+    # --xray-verify 已移除（需真实 UUID，SNI 健康检查已覆盖 80% 价值）
     ap.add_argument("--evening", action="store_true",
                     help="晚高峰复测模式：只对历史 top 做轻量复测")
     ap.add_argument("--geo", action="store_true",
@@ -1148,6 +1149,8 @@ def main():
     ap.add_argument("--carrier", choices=["CT", "CU", "CM", "ct", "cu", "cm"], default=None,
                     help="手动指定运营商（自动检测失败时用）")
     ap.add_argument("--push", action="store_true")
+    ap.add_argument("--force-push", action="store_true",
+                    help="出口不在国内（开着 VPN）时也强制 push，默认不推")
     args = ap.parse_args()
 
     # 触发器探测模式（独立）
@@ -1166,9 +1169,13 @@ def main():
     if args.v4_only:
         families = [4]
 
-    carrier, egress = detect_carrier(args.carrier)
+    carrier, egress, egress_country = detect_carrier(args.carrier)
     network_type = detect_network_type()
-    print(f"ℹ️ 出口：{carrier} ({egress})，网络：{network_type}")
+    # 出口不在国内（多半开着 VPN）：测到的是代理线路，不是本机宽带/5G，不能当国内实测
+    egress_cn = egress_country == "CN" if egress_country else None
+    print(f"ℹ️ 出口：{carrier} ({egress}, {egress_country or '国家未知'})，网络：{network_type}")
+    if egress_cn is False:
+        print("⚠️ 出口不在国内，多半开着 VPN。这次结果只写本地，不会 push；关掉 VPN 再跑才是真实线路。")
     if 6 in families and not args.v6_only:
         # 多端点检测本机 v6 连通性（单端点 3 秒判死刑太草率）
         v6_local = has_ipv6()
@@ -1208,7 +1215,7 @@ def main():
         mark = "✅" if ok_n == len(r) else f"⚠️{ok_n}/{len(r)}"
         print(f"  {cand['ip']} [{cand['colo']}] {mark}")
 
-    # 纯净度第三层：proxy 标记（v2.5：ipapi.is 已死，用 ip-api proxy 字段）
+    # 纯净度第三层：proxy 标记（ipapi.is 已死，用 ip-api proxy 字段）
     # proxy=true → 软降权 ×0.9，不淘汰（有误报可能）
     print(f"\n{'='*50}\n纯净度第三层：proxy 标记\n{'='*50}")
     for cand in all_candidates:
@@ -1253,7 +1260,7 @@ def main():
             # 历史可靠性
             hist = historical_reliability(conn, ip)
             c["history"] = hist
-            # v2.1 评分：Zeus 扣分制 + zqy857 完整度/新鲜度 + 带宽加成
+            # 评分：Zeus 扣分制 + zqy857 完整度/新鲜度 + 带宽加成
             # 基础 100，丢包第一（无上限），延迟第二，抖动第三
             s = 100.0
             s -= c.get("loss_pct", 0) * 0.9
@@ -1272,11 +1279,11 @@ def main():
             # GFW 敏感降权（但不直接扔，冷却后可能恢复）
             if c["gfw_sensitive"]:
                 s *= 0.85
-            # 纯净度第三层：proxy 标记软降权（v2.5：×0.9，不淘汰）
+            # 纯净度第三层：proxy 标记软降权（×0.9，不淘汰）
             if c.get("is_proxy"):
                 s *= 0.9
                 print(f"    {c['ip']} proxy 标记，降权10%")
-            # 纯净度第二层：AI 握手不全过降权（v2.5：4 个 CF 托管目标）
+            # 纯净度第二层：AI 握手不全过降权（4 个 CF 托管目标）
             ai_ok = c.get("ai_ok", 4)
             if ai_ok < 4:
                 s *= (0.6 + 0.1 * ai_ok)  # 3/4→0.9, 2/4→0.8, 1/4→0.7, 0/4→0.6
@@ -1290,7 +1297,7 @@ def main():
             final.append(c)
         final.sort(key=lambda x: -x["final_score"])
     else:
-        # v2.6：默认排名引入丢包/抖动扣分（Zeus 式），不再纯按带宽
+        # 默认排名引入丢包/抖动扣分（Zeus 式），不再纯按带宽
         for c in all_candidates:
             if args.scene == "ai":
                 # AI 场景：延迟+零丢包优先，带宽几乎无关
@@ -1360,7 +1367,7 @@ def main():
             else:
                 print("  → 两者接近")
 
-    # v2.5 /24 分散过滤：每 /24 最多 5 个，至少 4 个 /24
+    # /24 分散过滤：每 /24 最多 5 个，至少 4 个 /24
     # （深挖结论：GFW 惩罚精确到单 IP，但情报是关联的）
     def diversify(cands, per_24=5, min_nets=4):
         from collections import defaultdict
@@ -1392,7 +1399,7 @@ def main():
 
     final = diversify(final)
 
-    # v2.9：--evening 晚高峰复测（只对 Top N 做 TCP+抖动轻量复测）
+    # --evening 晚高峰复测（只对 Top N 做 TCP+抖动轻量复测）
     if args.evening and final:
         import datetime
         hour = datetime.datetime.now().hour
@@ -1428,7 +1435,7 @@ def main():
         final.sort(key=lambda x: (x.get("peak_degraded", False),
                                   -x.get("final_score", 0)))
 
-    # v2.7：多 SNI 健康检查（如果用户提供了多个 SNI）
+    # 多 SNI 健康检查（如果用户提供了多个 SNI）
     sni_list = parse_sni_list(args.sni)
     if len(sni_list) > 1 and final:
         print(f"\n{'='*50}\nSNI 健康检查（{len(sni_list)} 个 SNI，Top {min(10, len(final))}）\n{'='*50}")
@@ -1443,14 +1450,14 @@ def main():
                 bad = [s for s, ok in health.items() if not ok]
                 print(f"    失败 SNI：{', '.join(bad[:3])}")
 
-    # v3.2：输出不足时，用上次结果里仍可达的 IP 补齐（订阅不突然变空/大换血）
+    # 输出不足时，用上次结果里仍可达的 IP 补齐（订阅不突然变空/大换血）
     final = merge_previous(final, MIN_OUTPUT)
 
     # 写文件：订阅生成器标准格式 IP:端口#备注，IPv6 加方括号
     with open("best-ips.txt", "w") as f:
         for x in final:
             f.write(format_sub_line(x, carrier, args.port) + "\n")
-    # v3.3：结构化回传，每个 IP 带运营商、网络类型、测量时间，订阅器可区分手机蜂窝与家宽数据
+    # 结构化回传，每个 IP 带运营商、网络类型、测量时间，订阅器可区分手机蜂窝与家宽数据
     measured_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     for x in final:
         x.setdefault("carrier", carrier)
@@ -1460,14 +1467,18 @@ def main():
         json.dump({"carrier": carrier,
                    "network_type": network_type,
                    "egress_hash": (hashlib.sha256(egress.encode()).hexdigest()[:12] if egress else None),
-                   "version": "3.3",
+                   "egress_country": egress_country,
+                   "egress_cn": egress_cn,
+                   "version": "3.4",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2, ensure_ascii=False)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
 
-    if args.push:
-        top_colo = final[0].get("colo", "?") if final else "?"
-        git_auto_push(len(final), top_colo, carrier, extra="v3.3")
+    if args.push and egress_cn is False and not args.force_push:
+        print("⏭️ 出口不在国内，跳过 push（确实要推就加 --force-push）")
+    elif args.push:
+        top_colo = final[0].get("colo") or "unknown" if final else "unknown"
+        git_auto_push(len(final), top_colo, carrier, extra="v3.4")
 
 
 if __name__ == "__main__":
