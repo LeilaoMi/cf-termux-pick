@@ -152,7 +152,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/2.1\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/2.2\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -207,7 +207,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=25000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.1\r\n\r\n")
+               f"User-Agent: cf-pick/2.2\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -264,7 +264,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.1\r\n\r\n")
+               f"User-Agent: cf-pick/2.2\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -407,12 +407,45 @@ def historical_reliability(conn, ip, days=7):
 # ---------------------------------------------------------------- 目标感知 + 触发器探测
 
 def ai_target_test(ip, timeout=8):
-    """对 AI 服务域名做 TLS 握手测试（不调 API）。返回 {domain: ok}。"""
+    """纯净度第二层：AI 目标 TLS 握手（不调 API）。返回 {domain: ok}。"""
     out = {}
     for dom in AI_TARGETS:
         ok, ftype, _ = tls_handshake(ip, dom, timeout=timeout)
         out[dom] = ok
     return out
+
+
+def abuse_check(ip, timeout=10):
+    """纯净度第三层：滥用标记检查（cfnb 方法论，best-effort）。
+
+    返回 (is_clean, detail)：
+      is_clean=True → 无滥用标记
+      is_clean=False → 有 proxy/vpn/tor/abuser 标记
+      is_clean=None → 检查失败（不阻塞）
+    """
+    try:
+        url = f"https://api.ipapi.is/?q={ip}"
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            d = json.load(r)
+        # cfnb 公式简化版
+        flags = 0
+        for key in ("is_proxy", "is_vpn", "is_tor", "is_crawler"):
+            if d.get(key):
+                flags += 1
+        # abuser_score
+        try:
+            company_score = float(str(d.get("company", {}).get("abuser_score", "0")).split()[0] or 0)
+            asn_score = float(str(d.get("asn", {}).get("abuse_score", "0")).split()[0] or 0)
+            abuse = (company_score + asn_score) / 2
+        except Exception:
+            abuse = 0
+        if d.get("is_bogon"):
+            return False, "bogon"
+        if flags > 0 or abuse > 0.2:
+            return False, f"flags={flags} abuse={abuse:.2f}"
+        return True, "clean"
+    except Exception as e:
+        return None, f"check_failed: {str(e)[:40]}"
 
 
 def probe_trigger(ip, sni=SPEED_SNI):
@@ -451,7 +484,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/2.1\r\n\r\n")
+               f"User-Agent: cf-pick/2.2\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -610,10 +643,10 @@ def git_auto_push(top_count, colo, carrier="?", extra=""):
 
 # ---------------------------------------------------------------- 主流程
 
-def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
-    """Phase 1：采样 → 四层漏斗。返回候选列表。"""
+def phase1_funnel(family, count, top_n, sni=SPEED_SNI):
+    """Phase 1：采样 → 四层漏斗（v2.2：不再按 colo 过滤，纯净度判别）。返回候选列表。"""
     fam_name = f"IPv{'6' if family == 6 else '4'}"
-    print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 四层漏斗\n{'='*50}")
+    print(f"\n{'='*50}\nPhase 1 [{fam_name}]：采样 {count} → 四层漏斗（纯净度）\n{'='*50}")
     ips = sample_ips(family, count)
     print(f"采样 {len(ips)} 个")
 
@@ -644,7 +677,7 @@ def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
     if not lat_ok:
         return []
 
-    # L2: colo 校验
+    # L2: trace 获取（拿 colo+loc，不再硬过滤）— v2.2 纯净度判别
     colo_ok = []
     for ip, lat, loss, jitter in lat_ok[:80]:
         tr = fetch_trace(ip, sni)
@@ -653,25 +686,35 @@ def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
         # Zeus: 403/409/429 = 可达但拒绝，直接进墓碑
         if tr.get("_blocked"):
             continue
-        if tr.get("colo") == colo:
-            colo_ok.append((ip, lat, loss, jitter))
-    print(f"L2 colo={colo}：{len(colo_ok)}")
+        ip_colo = tr.get("colo", "?")
+        ip_loc = tr.get("loc", "?")
+        colo_ok.append((ip, lat, loss, jitter, ip_colo, ip_loc))
+    print(f"L2 trace 成功：{len(colo_ok)}")
     if not colo_ok:
         return []
 
-    # L3: 送中过滤
+    # L3: 纯净度第一层 — Geo 一致性（trace loc vs ip-api）
     geo_ok = []
-    for ip, lat, loss, jitter in colo_ok:
+    for ip, lat, loss, jitter, ip_colo, ip_loc in colo_ok:
         is_cn, country = check_geo(ip)
-        if not is_cn:
-            geo_ok.append((ip, lat, loss, jitter, country))
-    print(f"L3 非 CN：{len(geo_ok)}")
+        # 纯净度判定：两个源都不说 CN，且互相一致（允许一个未知）
+        trace_cn = (ip_loc == "CN")
+        api_cn = is_cn
+        if trace_cn or api_cn:
+            continue  # 任一说 CN → 扔
+        # 一致性：都不为 ? 时必须相同
+        if ip_loc != "?" and country != "?":
+            # ip-api 返回全称（"United States"），trace 返回代码（"US"）
+            # 简化：只要 trace loc 不是 CN 就过（ip-api 已确认非 CN）
+            pass
+        geo_ok.append((ip, lat, loss, jitter, ip_colo, ip_loc, country))
+    print(f"L3 纯净度-Geo一致（双源非CN）：{len(geo_ok)}")
     if not geo_ok:
         return []
 
     # L4: 测速
     scored = []
-    for ip, lat, loss, jitter, country in geo_ok[:30]:
+    for ip, lat, loss, jitter, ip_colo, ip_loc, country in geo_ok[:30]:
         mbps = speed_test(ip, sni)
         if mbps > 1.0:
             scored.append({"ip": ip, "family": family,
@@ -679,7 +722,7 @@ def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
                            "loss_pct": round(loss * 100, 1),
                            "jitter_ms": round(jitter * 1000, 1),
                            "mbps": round(mbps, 2), "country": country,
-                           "colo": colo})
+                           "colo": ip_colo, "loc": ip_loc})
     scored.sort(key=lambda x: -x["mbps"])
     top = scored[:top_n]
     print(f"L4 测速 >1MB/s：{len(scored)}，取 Top {len(top)}")
@@ -691,7 +734,8 @@ def phase1_funnel(family, colo, count, top_n, sni=SPEED_SNI):
 
 def main():
     ap = argparse.ArgumentParser(description="cf-pick v2.0 双栈+稳定性+GFW感知")
-    ap.add_argument("--colo", default="SJC")
+    ap.add_argument("--colo", default=None,
+                    help="v2.2已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=200,
                     help="每协议栈采样数")
     ap.add_argument("--top", type=int, default=20,
@@ -743,12 +787,35 @@ def main():
     # Phase 1
     all_candidates = []
     for fam in families:
-        cands = phase1_funnel(fam, args.colo, args.count, args.top)
+        cands = phase1_funnel(fam, args.count, args.top)
         all_candidates.extend(cands)
 
     if not all_candidates:
         print("❌ 漏斗无结果")
         sys.exit(1)
+
+    # 纯净度第二层：AI 握手（Top 候选默认执行）
+    print(f"\n{'='*50}\n纯净度第二层：AI 目标握手\n{'='*50}")
+    for cand in all_candidates:
+        r = ai_target_test(cand["ip"])
+        cand["ai_targets"] = r
+        ok_n = sum(1 for v in r.values() if v)
+        cand["ai_ok"] = ok_n
+        mark = "✅" if ok_n == len(r) else f"⚠️{ok_n}/{len(r)}"
+        print(f"  {cand['ip']} [{cand['colo']}] {mark}")
+
+    # 纯净度第三层：滥用标记（best-effort，失败不阻塞）
+    print(f"\n{'='*50}\n纯净度第三层：滥用标记\n{'='*50}")
+    for cand in all_candidates:
+        clean, detail = abuse_check(cand["ip"])
+        cand["abuse_clean"] = clean
+        cand["abuse_detail"] = detail
+        if clean is True:
+            print(f"  {cand['ip']} ✅ 纯净")
+        elif clean is False:
+            print(f"  {cand['ip']} ❌ {detail} → 降权")
+        else:
+            print(f"  {cand['ip']} ❓ 检查失败，不阻塞")
 
     conn = init_db()
 
@@ -802,6 +869,14 @@ def main():
             # GFW 敏感降权（但不直接扔，冷却后可能恢复）
             if c["gfw_sensitive"]:
                 s *= 0.85
+            # 纯净度第三层：滥用标记降权
+            if c.get("abuse_clean") is False:
+                s *= 0.7
+                print(f"    {c['ip']} 滥用标记，降权30%")
+            # 纯净度第二层：AI 握手不全过降权
+            ai_ok = c.get("ai_ok", 3)
+            if ai_ok < 3:
+                s *= (0.7 + 0.1 * ai_ok)  # 2/3→0.9, 1/3→0.8, 0/3→0.7
             c["final_score"] = round(max(0, s), 1)
             # 入库
             record_history(conn, ip, c["family"], args.colo, carrier,
@@ -833,7 +908,7 @@ def main():
         else:
             # 非 burn-in 模式也显示丢包/抖动
             extra = f" 丢包{c.get('loss_pct',0)}% 抖动{c.get('jitter_ms',0)}ms"
-        print(f"  {i}. {c['ip']} [{fam}] {c['mbps']}MB/s "
+        print(f"  {i}. {c['ip']} [{fam}/{c.get('colo','?')}] {c['mbps']}MB/s "
               f"分{c['final_score']}{extra}")
 
     # v4/v6 对比
@@ -859,7 +934,7 @@ def main():
             f.write(f"{c['ip']}#v{c['family']}-{args.colo}\n")
     with open("best-ips.json", "w") as f:
         json.dump({"colo": args.colo, "carrier": carrier,
-                   "version": "2.1",
+                   "version": "2.2",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
