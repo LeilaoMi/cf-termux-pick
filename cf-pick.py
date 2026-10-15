@@ -305,20 +305,53 @@ async def layer4_speed(candidates, concurrency):
 # 主流程
 # ---------------------------------------------------------------------------
 
-def git_auto_push(top_count, colo):
+def detect_carrier():
+    """检测本机出口运营商。返回 (CT/CU/CM/?, 出口 IP)。三网通用。"""
+    try:
+        with urllib.request.urlopen(
+                "http://ip-api.com/json/?fields=isp,org,query",
+                timeout=10) as r:
+            d = json.load(r)
+            isp = (d.get("isp", "") or "") + " " + (d.get("org", "") or "")
+            ip = d.get("query")
+            if "联通" in isp or "Unicom" in isp:
+                return "CU", ip
+            if "电信" in isp or "Telecom" in isp:
+                return "CT", ip
+            if "移动" in isp or "Mobile" in isp:
+                return "CM", ip
+            return "?", ip
+    except Exception:
+        return "?", None
+
+
+def git_auto_push(top_count, colo, carrier="?"):
     """跑完自动 git add/commit/push。失败不抛异常，只打印手动命令。"""
     import subprocess
 
     def run(cmd, timeout=60):
         return subprocess.run(cmd, capture_output=True, timeout=timeout)
 
+    # Termux 上经常没配 git 身份，自动补一个本地配置
     try:
-        run(["git", "add", "best-ips.txt", "best-ips.json"], timeout=30)
+        r = run(["git", "config", "user.email"], timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            run(["git", "config", "user.email", "cf-pick@termux.local"], timeout=10)
+            run(["git", "config", "user.name", "cf-pick"], timeout=10)
+            print("ℹ️ 已自动配置 git 身份（cf-pick@termux.local）")
+    except Exception:
+        pass
+
+    try:
+        r = run(["git", "add", "best-ips.txt", "best-ips.json"], timeout=30)
+        if r.returncode != 0:
+            print("⚠️ git add 失败")
+            return False
     except FileNotFoundError:
         print("⚠️ 没找到 git，请手动 push")
         return False
     except Exception as e:
-        print(f"⚠️ git add 失败：{e}")
+        print(f"⚠️ git add 异常：{e}")
         return False
 
     # 没变化就不提交
@@ -330,9 +363,14 @@ def git_auto_push(top_count, colo):
     except Exception:
         pass
 
-    msg = f"update {time.strftime('%Y-%m-%d %H:%M')}: {top_count} IPs ({colo})"
+    msg = f"update {time.strftime('%Y-%m-%d %H:%M')}: {top_count} IPs ({colo}/{carrier})"
     try:
-        run(["git", "commit", "-m", msg], timeout=30)
+        cm = run(["git", "commit", "-m", msg], timeout=30)
+        if cm.returncode != 0:
+            err = cm.stderr.decode("utf-8", "ignore")[:200]
+            print(f"⚠️ git commit 失败：{err}")
+            print("  请手动执行：git commit -m update && git push")
+            return False
         push = run(["git", "push"], timeout=120)
         if push.returncode == 0:
             print("✅ 已自动 push 到仓库")
@@ -403,6 +441,7 @@ async def main_async(args):
     ]
     with open("best-ips.json", "w") as f:
         json.dump({"colo": args.colo,
+                   "carrier": carrier,
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": detail}, f, indent=2)
 
@@ -410,8 +449,11 @@ async def main_async(args):
     for ip, ms, colo, cc, mbps in top:
         print(f"  {ip}:443  {ms}ms  {colo}  {cc}  {mbps}Mbps")
 
+    carrier, _ = detect_carrier()
+    print(f"ℹ️ 出口运营商：{carrier}")
+
     if args.push:
-        git_auto_push(len(top), args.colo)
+        git_auto_push(len(top), args.colo, carrier)
 
 
 def main():
