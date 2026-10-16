@@ -132,6 +132,7 @@ chmod +x ~/.shortcuts/cf-pick
 
 ## 版本历史
 
+- **v3.7**：IPv6 只在实际有应答的 Cloudflare /48 段里采样（以前在整个 /32、/29 里随机抽，几乎全是空地址，所以 v6 结果为空）；每次运行的输出写进 `last-run.log`，widget 跑完窗口关了也能看：`cat ~/cf-termux-pick/last-run.log`
 - **v3.6**：IPv6 检测改为先看本机公网 v6、再连阿里 DNS / Cloudflare 边缘，不再因谷歌被墙误判没有 v6；网络类型按 WiFi 实际连接状态判断，5G 不再被误标成 wifi
 - **v3.5**：推送更稳：每次 push 限时 45 秒（慢速自动断开），失败重试 3 次并显示进度；还推不上就提示开 VPN，每 10 秒探一次 GitHub、最多等 5 分钟（Ctrl+C 跳过）；没推上去的提交下次运行开头自动补推
 - **v3.4**：自动识别出口国家，开着 VPN（出口不在国内）时不 push，避免把代理线路当成国内实测回传订阅器（`--force-push` 可强推）；`best-ips.json` 增加 `egress_country`/`egress_cn`，订阅器据此把手机实测并入三网排序；备注里机房未知时写 `UNK` 而不是 `?`；清理旧版本注释
