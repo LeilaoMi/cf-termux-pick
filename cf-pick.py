@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cf-pick.py v3.5 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
+cf-pick.py v3.6 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
 
 Phase 1: 双栈采样 → 四层漏斗（TCP延迟 → colo → 送中过滤 → 测速）
 Phase 2: 稳定性 burn-in（多轮复测，识别 GFW 残余审查模式）
@@ -256,7 +256,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.5\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.6\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -368,7 +368,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
                f"Referer: https://{sni}/\r\n"
-               f"User-Agent: cf-pick/3.5\r\n\r\n")
+               f"User-Agent: cf-pick/3.6\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -447,7 +447,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.5\r\n\r\n")
+               f"User-Agent: cf-pick/3.6\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -545,10 +545,13 @@ def stability_score(rounds_results):
 # ---------------------------------------------------------------- Phase 4: 历史库
 
 def detect_network_type():
-    """检测网络类型（WiFi/蜂窝/未知）。"""
+    """检测网络类型（wifi/cellular/unknown）。
+
+    termux-wifi-connectioninfo 没连 WiFi 时也会返回带 "ssid" 字段的 JSON（值是 <unknown ssid>），
+    以前只查有没有 "ssid" 这个词，用 5G 也会被判成 wifi。现在看连接状态。
+    """
     import subprocess
     try:
-        # 方法1：ip route 看网卡名
         r = subprocess.run(["ip", "route", "show", "default"],
                            capture_output=True, text=True, timeout=3)
         out = r.stdout.lower()
@@ -559,11 +562,15 @@ def detect_network_type():
     except Exception:
         pass
     try:
-        # 方法2：Termux:API
         r = subprocess.run(["termux-wifi-connectioninfo"],
-                           capture_output=True, text=True, timeout=3)
-        if r.returncode == 0 and "ssid" in r.stdout.lower():
-            return "wifi"
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            info = json.loads(r.stdout)
+            connected = (str(info.get("supplicant_state", "")).upper() == "COMPLETED"
+                         and info.get("ip") not in (None, "", "0.0.0.0")
+                         and "unknown ssid" not in str(info.get("ssid", "")).lower())
+            # 能上网（已经测出了出口）又没连 WiFi，就是蜂窝
+            return "wifi" if connected else "cellular"
     except Exception:
         pass
     return "unknown"
@@ -716,7 +723,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.5\r\n\r\n")
+               f"User-Agent: cf-pick/3.6\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -785,7 +792,7 @@ def detect_carrier(override=None):
     country = None
     for url, pick in sources:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.5"})
+            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.6"})
             with urllib.request.urlopen(req, timeout=8) as r:
                 text, ip, cc = pick(json.load(r))
             egress = egress or ip
@@ -798,18 +805,37 @@ def detect_carrier(override=None):
     return (override.upper() if override else "CN"), egress, country
 
 
+def local_ipv6():
+    """本机出口用的 IPv6 地址（UDP connect 不发包，只让系统选路由）。没有公网 v6 返回 None。"""
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2400:3200::1", 53))
+        addr = s.getsockname()[0]
+        s.close()
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        return str(ip) if ip.is_global else None
+    except Exception:
+        return None
+
+
 def has_ipv6():
-    """多端点检测 IPv6 连通性。任一成功即判定可用。"""
-    test_ips = [
-        "2606:4700:4700::1111",  # Cloudflare DNS
-        "2001:4860:4860::8888",  # Google DNS
-        "2606:4700:4700::1001",  # Cloudflare DNS 备用
+    """IPv6 连通性：先看本机有没有公网 v6，再连国内/CF 端点，任一通就算有。
+
+    以前只连谷歌和 Cloudflare 的 DNS（443），国内一个被墙一个常被重置，有 v6 也会误判没有。
+    """
+    if not local_ipv6():
+        return False
+    endpoints = [
+        ("2400:3200::1", 53),          # 阿里 DNS
+        ("240c::6666", 53),            # 下一代互联网 DNS
+        ("2606:4700::6810:1", 443),    # Cloudflare 边缘（就是要测的那类地址）
+        ("2606:4700:4700::1111", 443), # Cloudflare DNS
     ]
-    for tip in test_ips:
+    for host, port in endpoints:
         try:
             s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect((tip, 443))
+            s.settimeout(4)
+            s.connect((host, port))
             s.close()
             return True
         except Exception:
@@ -1175,7 +1201,7 @@ def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v3.5 双栈+稳定性+GFW感知")
+    ap = argparse.ArgumentParser(description="cf-pick v3.6 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
@@ -1539,7 +1565,7 @@ def main():
         print("⏭️ 出口不在国内，跳过 push（确实要推就加 --force-push）")
     elif args.push:
         top_colo = final[0].get("colo") or "unknown" if final else "unknown"
-        git_auto_push(len(final), top_colo, carrier, extra="v3.5")
+        git_auto_push(len(final), top_colo, carrier, extra="v3.6")
 
 
 if __name__ == "__main__":
