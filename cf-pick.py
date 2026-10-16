@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cf-pick.py v3.4 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
+cf-pick.py v3.5 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
 
 Phase 1: 双栈采样 → 四层漏斗（TCP延迟 → colo → 送中过滤 → 测速）
 Phase 2: 稳定性 burn-in（多轮复测，识别 GFW 残余审查模式）
@@ -256,7 +256,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.4\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.5\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -368,7 +368,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
                f"Referer: https://{sni}/\r\n"
-               f"User-Agent: cf-pick/3.4\r\n\r\n")
+               f"User-Agent: cf-pick/3.5\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -447,7 +447,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.4\r\n\r\n")
+               f"User-Agent: cf-pick/3.5\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -716,7 +716,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.4\r\n\r\n")
+               f"User-Agent: cf-pick/3.5\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -785,7 +785,7 @@ def detect_carrier(override=None):
     country = None
     for url, pick in sources:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.4"})
+            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.5"})
             with urllib.request.urlopen(req, timeout=8) as r:
                 text, ip, cc = pick(json.load(r))
             egress = egress or ip
@@ -860,6 +860,9 @@ def git_auto_push(top_count, colo, carrier="CN", extra=""):
             print("⚠️ git status 失败")
             return False
         if not st.stdout.strip():
+            if commits_ahead(run) > 0:
+                print("ℹ️ 结果无变化，但有之前没推上去的提交")
+                return push_with_retry(run)
             print("ℹ️ 结果无变化，跳过 push")
             return True
     except Exception:
@@ -876,37 +879,92 @@ def git_auto_push(top_count, colo, carrier="CN", extra=""):
                         timeout=10).stdout.decode().strip()[:8]
         print(f"ℹ️ 本地 commit：{local_sha}")
 
-        push = run(["git", "push"], timeout=120)
-        if push.returncode != 0:
-            err = push.stderr.decode("utf-8", "ignore")[:200]
-            print(f"⚠️ push 失败：{err}")
-            print("  请手动执行：git push")
-            return False
-
-        # 自证：fetch 后对比远端 SHA，不一致就是没推上去
-        run(["git", "fetch", "origin"], timeout=30)
-        # 找当前分支的上游
-        up = run(["git", "rev-parse", "--abbrev-ref",
-                  "--symbolic-full-name", "@{u}"], timeout=10)
-        upstream = up.stdout.decode().strip() if up.returncode == 0 else "origin/main"
-        remote_sha = run(["git", "rev-parse", upstream],
-                         timeout=10).stdout.decode().strip()[:8]
-        local_full = run(["git", "rev-parse", "HEAD"],
-                         timeout=10).stdout.decode().strip()[:8]
-        if local_full == remote_sha:
-            print(f"✅ 已 push 到仓库（远端已验证：{remote_sha}）")
-            return True
-        else:
-            print(f"⚠️ push 返回成功，但远端 SHA({remote_sha})≠本地({local_full})，实际没推上去")
-            print("  请手动执行：git push")
-            return False
+        return push_with_retry(run)
     except Exception as e:
         print(f"⚠️ push 异常：{e}")
     print("  请手动执行：git push")
     return False
 
 
-# ---------------------------------------------------------------- 主流程
+# 国内直连 GitHub 时通时不通：每次 push 限时、慢速自动断开，失败重试；
+# 还不行就等你开 VPN（每 10 秒探一次，最多 5 分钟）；最后没推上去的，下次运行开头补推。
+PUSH_ATTEMPTS = 3
+PUSH_TIMEOUT = 45
+WAIT_SECONDS = 300
+WAIT_STEP = 10
+# 30 秒内速度低于 1KB/s 就放弃这次连接，不再干等到超时
+GIT_NET = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30"]
+
+
+def _git_run(cmd, timeout=60):
+    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+def commits_ahead(run=_git_run):
+    """本地比远端多几个提交（没推上去的）。查不到上游返回 0。"""
+    try:
+        r = run(["git", "rev-list", "--count", "@{u}..HEAD"], timeout=10)
+        return int(r.stdout.decode().strip() or 0) if r.returncode == 0 else 0
+    except Exception:
+        return 0
+
+
+def _push_once(run, timeout=PUSH_TIMEOUT):
+    try:
+        r = run(["git", *GIT_NET, "push"], timeout=timeout)
+        if r.returncode == 0:
+            return True, ""
+        return False, r.stderr.decode("utf-8", "ignore").strip().splitlines()[-1:] or [""]
+    except subprocess.TimeoutExpired:
+        return False, [f"{timeout} 秒没推完"]
+
+
+def github_reachable(run=_git_run, timeout=15):
+    try:
+        return run(["git", *GIT_NET, "ls-remote", "--heads", "origin"], timeout=timeout).returncode == 0
+    except Exception:
+        return False
+
+
+def push_with_retry(run=_git_run, wait=True, attempts=PUSH_ATTEMPTS):
+    for attempt in range(1, attempts + 1):
+        print(f"⏫ 正在推送到 GitHub（第 {attempt}/{attempts} 次）…", flush=True)
+        ok, err = _push_once(run)
+        if ok and commits_ahead(run) == 0:
+            print("✅ 已 push 到仓库")
+            return True
+        print(f"  没推上去：{err[0] if err else '远端没更新'}", flush=True)
+        if attempt < attempts:
+            time.sleep(5 * attempt)
+    if wait:
+        print(f"📶 直连 GitHub 不通。现在可以打开 VPN（测速已经结束），我每 {WAIT_STEP} 秒试一次，最多等 {WAIT_SECONDS // 60} 分钟；"
+              "Ctrl+C 可跳过，下次运行会自动补推。", flush=True)
+        deadline = time.time() + WAIT_SECONDS
+        try:
+            while time.time() < deadline:
+                time.sleep(WAIT_STEP)
+                if github_reachable(run):
+                    ok, err = _push_once(run)
+                    if ok and commits_ahead(run) == 0:
+                        print("✅ 已 push 到仓库")
+                        return True
+                left = int(deadline - time.time())
+                print(f"  还没通，再等 {max(left, 0)} 秒", flush=True)
+        except KeyboardInterrupt:
+            print("\n⏭️ 已跳过等待")
+    print("⚠️ 这次没推上去，结果已提交到本地，下次运行开头会自动补推（也可以手动 git push）")
+    return False
+
+
+def push_pending():
+    """运行开头补推上次没推上去的提交（只试，不等）。"""
+    n = commits_ahead()
+    if n <= 0:
+        return
+    print(f"ℹ️ 上次有 {n} 个提交没推上去，先补推")
+    # 只试一次，别拖住测速；不通就留到这次跑完再推
+    push_with_retry(wait=False, attempts=1)
+
 
 def _l1_probe(ip):
     """L1 单 IP：3 探针，返回 (ip, worst, loss, jitter) 或 None。"""
@@ -1117,7 +1175,7 @@ def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v3.4 双栈+稳定性+GFW感知")
+    ap = argparse.ArgumentParser(description="cf-pick v3.5 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
@@ -1168,6 +1226,9 @@ def main():
         families = [6]
     if args.v4_only:
         families = [4]
+
+    if args.push:
+        push_pending()
 
     carrier, egress, egress_country = detect_carrier(args.carrier)
     network_type = detect_network_type()
@@ -1478,7 +1539,7 @@ def main():
         print("⏭️ 出口不在国内，跳过 push（确实要推就加 --force-push）")
     elif args.push:
         top_colo = final[0].get("colo") or "unknown" if final else "unknown"
-        git_auto_push(len(final), top_colo, carrier, extra="v3.4")
+        git_auto_push(len(final), top_colo, carrier, extra="v3.5")
 
 
 if __name__ == "__main__":
