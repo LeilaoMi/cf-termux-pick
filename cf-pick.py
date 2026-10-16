@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cf-pick.py v3.6 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
+cf-pick.py v3.7 — Cloudflare 优选 IP（双栈 + 稳定性 + GFW 感知）
 
 Phase 1: 双栈采样 → 四层漏斗（TCP延迟 → colo → 送中过滤 → 测速）
 Phase 2: 稳定性 burn-in（多轮复测，识别 GFW 残余审查模式）
@@ -27,6 +27,7 @@ import sqlite3
 import ssl
 import statistics
 import subprocess
+import os
 import sys
 import time
 import urllib.request
@@ -48,6 +49,35 @@ CF_V6 = [
     "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
     "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
     "2c0f:f248::/32",
+]
+
+# 实际有 HTTPS 应答的 Cloudflare IPv6 /48（来自 XIU2/CloudflareSpeedTest ipv6.txt，2026-10-16）。
+# 官方 /32、/29 里绝大部分地址没人监听，在整段里随机抽基本全是空号，所以 v6 只在这些 /48 里抽。
+CF_V6_HOT = [
+    "2400:cb00:2049::/48", "2400:cb00:f00e::/48", "2606:4700:10::/48", "2606:4700:130::/48",
+    "2606:4700:3000::/48", "2606:4700:3001::/48", "2606:4700:3002::/48", "2606:4700:3003::/48",
+    "2606:4700:3004::/48", "2606:4700:3005::/48", "2606:4700:3006::/48", "2606:4700:3007::/48",
+    "2606:4700:3008::/48", "2606:4700:3009::/48", "2606:4700:3010::/48", "2606:4700:3011::/48",
+    "2606:4700:3012::/48", "2606:4700:3013::/48", "2606:4700:3014::/48", "2606:4700:3015::/48",
+    "2606:4700:3016::/48", "2606:4700:3017::/48", "2606:4700:3018::/48", "2606:4700:3019::/48",
+    "2606:4700:3020::/48", "2606:4700:3021::/48", "2606:4700:3022::/48", "2606:4700:3023::/48",
+    "2606:4700:3024::/48", "2606:4700:3025::/48", "2606:4700:3026::/48", "2606:4700:3027::/48",
+    "2606:4700:3028::/48", "2606:4700:3029::/48", "2606:4700:3030::/48", "2606:4700:3031::/48",
+    "2606:4700:3032::/48", "2606:4700:3033::/48", "2606:4700:3034::/48", "2606:4700:3035::/48",
+    "2606:4700:3036::/48", "2606:4700:3037::/48", "2606:4700:3038::/48", "2606:4700:3039::/48",
+    "2606:4700:a0::/48", "2606:4700:a1::/48", "2606:4700:a8::/48", "2606:4700:a9::/48",
+    "2606:4700:a::/48", "2606:4700:b::/48", "2606:4700:c::/48", "2606:4700:d0::/48",
+    "2606:4700:d1::/48", "2606:4700:d::/48", "2606:4700:e0::/48", "2606:4700:e1::/48",
+    "2606:4700:e2::/48", "2606:4700:e3::/48", "2606:4700:e4::/48", "2606:4700:e5::/48",
+    "2606:4700:e6::/48", "2606:4700:e7::/48", "2606:4700:e::/48", "2606:4700:f1::/48",
+    "2606:4700:f2::/48", "2606:4700:f3::/48", "2606:4700:f4::/48", "2606:4700:f5::/48",
+    "2606:4700:f::/48", "2803:f800:50::/48", "2803:f800:51::/48", "2a06:98c1:3100::/48",
+    "2a06:98c1:3101::/48", "2a06:98c1:3102::/48", "2a06:98c1:3103::/48", "2a06:98c1:3104::/48",
+    "2a06:98c1:3105::/48", "2a06:98c1:3106::/48", "2a06:98c1:3107::/48", "2a06:98c1:3108::/48",
+    "2a06:98c1:3109::/48", "2a06:98c1:310a::/48", "2a06:98c1:310b::/48", "2a06:98c1:310c::/48",
+    "2a06:98c1:310d::/48", "2a06:98c1:310e::/48", "2a06:98c1:310f::/48", "2a06:98c1:3120::/48",
+    "2a06:98c1:3121::/48", "2a06:98c1:3122::/48", "2a06:98c1:3123::/48", "2a06:98c1:3200::/48",
+    "2a06:98c1:50::/48", "2a06:98c1:51::/48", "2a06:98c1:54::/48", "2a06:98c1:58::/48",
 ]
 
 # GFW 残余审查时长：学术实测 120-180 秒，冷却取 300 秒保底
@@ -131,6 +161,19 @@ def sample_ips(family, count, conn=None, exploit_ratio=0.6):
     """
     ranges = CF_V4 if family == 4 else CF_V6
     out = set()
+
+    if family == 6:
+        # 每个 /48 等概率，块内随机取 host（不按地址数加权，否则全落进最大那段）
+        nets6 = [ipaddress.ip_network(c) for c in CF_V6_HOT]
+        guard = 0
+        while len(out) < count and guard < count * 10:
+            guard += 1
+            net = random.choice(nets6)
+            base = int(net.network_address)
+            # 低 64 位里随机；高位前 16 位子网也随机
+            ip_int = base + (random.getrandbits(16) << 64) + random.getrandbits(64)
+            out.add(str(ipaddress.ip_address(ip_int)))
+        return list(out)
 
     # 智能部分：从优质 /24 里采样
     smart_count = 0
@@ -256,7 +299,7 @@ def fetch_trace(ip, sni="speed.cloudflare.com", timeout=10):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\n"
-               f"Connection: close\r\nUser-Agent: cf-pick/3.6\r\n\r\n")
+               f"Connection: close\r\nUser-Agent: cf-pick/3.7\r\n\r\n")
         ss.sendall(req.encode())
         data = b""
         while True:
@@ -368,7 +411,7 @@ def speed_test(ip, sni=SPEED_SNI, seconds=8, timeout=15,
         req = (f"GET {SPEED_URL_PATH}?bytes={SPEED_BYTES} HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
                f"Referer: https://{sni}/\r\n"
-               f"User-Agent: cf-pick/3.6\r\n\r\n")
+               f"User-Agent: cf-pick/3.7\r\n\r\n")
         ss.sendall(req.encode())
         # 跳过响应头
         head = b""
@@ -447,7 +490,7 @@ def stability_round(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=3000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.6\r\n\r\n")
+               f"User-Agent: cf-pick/3.7\r\n\r\n")
         ss.sendall(req.encode())
         received = 0
         t1 = time.monotonic()
@@ -723,7 +766,7 @@ def probe_trigger(ip, sni=SPEED_SNI):
         ss = ctx.wrap_socket(s, server_hostname=sni)
         req = (f"GET {SPEED_URL_PATH}?bytes=50000000 HTTP/1.1\r\n"
                f"Host: {sni}\r\nConnection: close\r\n"
-               f"User-Agent: cf-pick/3.6\r\n\r\n")
+               f"User-Agent: cf-pick/3.7\r\n\r\n")
         ss.sendall(req.encode())
         t0 = time.monotonic()
         received = 0
@@ -792,7 +835,7 @@ def detect_carrier(override=None):
     country = None
     for url, pick in sources:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.6"})
+            req = urllib.request.Request(url, headers={"User-Agent": "cf-pick/3.7"})
             with urllib.request.urlopen(req, timeout=8) as r:
                 text, ip, cc = pick(json.load(r))
             egress = egress or ip
@@ -1200,8 +1243,31 @@ def merge_previous(final, min_count=MIN_OUTPUT, path="best-ips.json"):
     return final
 
 
+class _Tee:
+    """同时写屏幕和 last-run.log（widget 跑完窗口就关，事后看日志）。"""
+    def __init__(self, stream, path):
+        self.stream = stream
+        self.f = open(path, "w", encoding="utf-8")
+    def write(self, data):
+        self.stream.write(data)
+        try:
+            self.f.write(data); self.f.flush()
+        except Exception:
+            pass
+    def flush(self):
+        self.stream.flush()
+    def isatty(self):
+        return self.stream.isatty()
+
+
 def main():
-    ap = argparse.ArgumentParser(description="cf-pick v3.6 双栈+稳定性+GFW感知")
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last-run.log")
+        sys.stdout = _Tee(sys.stdout, log_path)
+        sys.stderr = _Tee(sys.stderr, log_path + ".err")
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser(description="cf-pick v3.7 双栈+稳定性+GFW感知")
     ap.add_argument("--colo", default=None,
                     help="已废弃：不再按colo过滤，保留参数仅为兼容")
     ap.add_argument("--count", type=int, default=300,
@@ -1556,7 +1622,7 @@ def main():
                    "egress_hash": (hashlib.sha256(egress.encode()).hexdigest()[:12] if egress else None),
                    "egress_country": egress_country,
                    "egress_cn": egress_cn,
-                   "version": "3.4",
+                   "version": "3.7",
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "ips": final}, f, indent=2, ensure_ascii=False)
     print(f"\n✅ 已写入 best-ips.txt/json（{len(final)} 个）")
@@ -1565,7 +1631,7 @@ def main():
         print("⏭️ 出口不在国内，跳过 push（确实要推就加 --force-push）")
     elif args.push:
         top_colo = final[0].get("colo") or "unknown" if final else "unknown"
-        git_auto_push(len(final), top_colo, carrier, extra="v3.6")
+        git_auto_push(len(final), top_colo, carrier, extra="v3.7")
 
 
 if __name__ == "__main__":
