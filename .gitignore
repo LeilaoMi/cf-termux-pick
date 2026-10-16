@@ -1,0 +1,4 @@
+last-run.log
+last-run.log.err
+__pycache__/
+*.db
