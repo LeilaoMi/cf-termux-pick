@@ -356,7 +356,7 @@ def _geo_single(ip, timeout=8):
         pass
     # L2: ipwho.is
     try:
-        with urllib.request.urlopen(f"http://ipwho.is/{ip}", timeout=timeout) as r:
+        with urllib.request.urlopen(f"https://ipwho.is/{ip}", timeout=timeout) as r:
             d = json.load(r)
         if d.get("success"):
             cc = d.get("country_code", "?")
