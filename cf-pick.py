@@ -21,13 +21,13 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
 import random
 import socket
 import sqlite3
 import ssl
 import statistics
 import subprocess
-import os
 import sys
 import time
 import urllib.request
@@ -266,7 +266,7 @@ def tls_handshake(ip, sni, port=443, timeout=8):
         s = socket.socket(fam, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((ip, port))
-    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+    except (TimeoutError, ConnectionRefusedError, OSError) as e:
         return False, "timeout", str(e)[:80]
 
     try:
@@ -467,7 +467,7 @@ def stability_round(ip, sni=SPEED_SNI):
     返回 dict(ip, ok, fail_type, latency_ms, mbps, ts)。
     fail_type: ok | timeout | tls_fail | rst_midstream | speed_zero
     """
-    t0 = time.monotonic()
+    t0 = time.monotonic()  # noqa: F841
     lat = tcp_ping(ip, timeout=3)
     if lat is None:
         return {"ip": ip, "ok": False, "fail_type": "timeout",
@@ -1129,7 +1129,7 @@ def phase1_funnel(family, count, top_n, sni=SPEED_SNI, conn=None, use_geo=False)
     else:
         geo_ok = [(ip, lat, loss, jit, colo, "?", False)
                   for ip, lat, loss, jit, colo, _loc in colo_ok]
-        print(f"L3 Geo：跳过（CF 官方段，--geo 可开启）")
+        print("L3 Geo：跳过（CF 官方段，--geo 可开启）")
     if not geo_ok:
         return []
     # 按（丢包, 延迟, 抖动）排序再取测速候选，不再按完成顺序随机取
@@ -1507,7 +1507,7 @@ def main():
     v4s = [c for c in final if c["family"] == 4]
     v6s = [c for c in final if c["family"] == 6]
     if v4s and v6s:
-        print(f"\n📊 v4/v6 对比：")
+        print("\n📊 v4/v6 对比：")
         if args.stability > 0:
             avg4 = sum(c["stability"] for c in v4s) / len(v4s)
             avg6 = sum(c["stability"] for c in v6s) / len(v6s)
@@ -1570,7 +1570,7 @@ def main():
             if lats:
                 import statistics
                 new_lat = max(lats) * 1000
-                new_jit = (statistics.pstdev(lats) * 1000
+                new_jit = (statistics.pstdev(lats) * 1000  # noqa: F841
                            if len(lats) > 1 else 0)
                 old_lat = x["latency_ms"]
                 # 高峰降级超过 50% 则标记
