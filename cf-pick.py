@@ -186,7 +186,7 @@ def sample_ips(family, count, conn=None, exploit_ratio=0.6):
             total_w = sum(weights)
             while len(out) < smart_target:
                 r = random.uniform(0, total_w)
-                for net, w in zip(nets, weights):
+                for net, w in zip(nets, weights, strict=True):
                     r -= w
                     if r <= 0:
                         # /24 内随机取一个 host
@@ -223,7 +223,7 @@ def sample_ips(family, count, conn=None, exploit_ratio=0.6):
     while len(out) < count and guard < count * 10:
         guard += 1
         r = random.uniform(0, total)
-        for net, w in zip(nets, weights):
+        for net, w in zip(nets, weights, strict=True):
             r -= w
             if r <= 0:
                 lo = int(net.network_address) + 1
